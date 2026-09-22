@@ -30,6 +30,7 @@ import torch
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -74,6 +75,7 @@ from .interfaces import (
     _require_is_multimodal,
 )
 from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
+from .ngm_residual import NgramResidual, parse_layer_ids, update_input_ids
 from .qwen3_next import (
     Qwen3NextAttention,
     Qwen3NextDecoderLayer,
@@ -203,6 +205,27 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 ),
             )
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        positions: torch.Tensor = None,
+        **kwargs: object,
+    ):
+        hidden_states, residual = super().forward(
+            hidden_states, residual, positions, **kwargs
+        )
+        memory = getattr(self, "_ngm_memory", None)
+        ids_fn = getattr(self, "_ngm_ids_fn", None)
+        if memory is None or ids_fn is None:
+            return hidden_states, residual
+        full_ids = ids_fn()
+        if full_ids is None:
+            return hidden_states, residual
+        stream = hidden_states if residual is None else hidden_states + residual
+        enhanced = memory(stream, full_ids)
+        return hidden_states + (enhanced - stream), residual
+
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -272,6 +295,41 @@ class Qwen3_5Model(Qwen3NextModel):
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        self._ngm_ids: torch.Tensor | None = None
+        self._ngm_enabled = False
+        if envs.VLLM_NGM:
+            layer_ids = parse_layer_ids(
+                envs.VLLM_NGM_LAYERS, config.num_hidden_layers
+            )
+            memory = NgramResidual(
+                self.embed_tokens,
+                embedding_dim=config.hidden_size,
+                output_scale=envs.VLLM_NGM_SCALE,
+            )
+            for i in layer_ids:
+                layer = self.layers[i]
+                if isinstance(layer, Qwen3_5DecoderLayer):
+                    layer._ngm_memory = memory
+                    layer._ngm_ids_fn = lambda: self._ngm_ids
+            self._ngm_enabled = True
+            logger.info(
+                "NGM residual enabled layers=%s scale=%s",
+                layer_ids,
+                envs.VLLM_NGM_SCALE,
+            )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
+        if self._ngm_enabled and input_ids is not None:
+            self._ngm_ids = update_input_ids(self._ngm_ids, input_ids)
+        return super().forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # FSE must match construction (Qwen3NextSparseMoeBlock): reroute the
