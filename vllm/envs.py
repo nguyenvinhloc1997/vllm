@@ -187,6 +187,9 @@ if TYPE_CHECKING:
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
+    VLLM_NGM: bool = False
+    VLLM_NGM_LAYERS: str = ""
+    VLLM_NGM_SCALE: float = 0.1
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
@@ -1506,6 +1509,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
         os.environ.get("VLLM_HUMMING_ONLINE_QUANT_CONFIG", None)
     ),
+    # syv patch (ngm-residual): train-free n-gram memory on qwen3_5
+    "VLLM_NGM": lambda: os.environ.get("VLLM_NGM", "0") == "1",
+    "VLLM_NGM_LAYERS": lambda: os.environ.get("VLLM_NGM_LAYERS", ""),
+    "VLLM_NGM_SCALE": lambda: float(os.environ.get("VLLM_NGM_SCALE", "0.1")),
     # The activation dtype config for humming kernel
     "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
         os.environ.get("VLLM_HUMMING_INPUT_QUANT_CONFIG", None)
