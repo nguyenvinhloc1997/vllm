@@ -240,6 +240,9 @@ if TYPE_CHECKING:
     VLLM_SPEC_ATTN_DEBUG: bool = False
     # GiB of vision-tower weights to keep in pinned host memory; 0 disables.
     VLLM_VISION_CPU_OFFLOAD_GB: float = 0.0
+    VLLM_NGM: bool = False
+    VLLM_NGM_LAYERS: str = ""
+    VLLM_NGM_SCALE: float = 0.1
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -1627,6 +1630,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_VISION_CPU_OFFLOAD_GB": lambda: float(
         os.environ.get("VLLM_VISION_CPU_OFFLOAD_GB", "0")
     ),
+    # syv patch (ngm-residual): train-free n-gram memory on qwen3_5
+    "VLLM_NGM": lambda: os.environ.get("VLLM_NGM", "0") == "1",
+    "VLLM_NGM_LAYERS": lambda: os.environ.get("VLLM_NGM_LAYERS", ""),
+    "VLLM_NGM_SCALE": lambda: float(os.environ.get("VLLM_NGM_SCALE", "0.1")),
     # The activation dtype config for humming kernel
     "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
         os.environ.get("VLLM_HUMMING_INPUT_QUANT_CONFIG", None)
