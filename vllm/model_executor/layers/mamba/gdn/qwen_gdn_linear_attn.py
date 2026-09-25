@@ -30,6 +30,14 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
+from vllm.model_executor.layers.mamba.damp_gdn_update import damp_fused_update
+from vllm.model_executor.layers.mamba.damp_runtime import (
+    damp_commit,
+    damp_prepare,
+    damp_read_rows,
+    damp_write_rows,
+    kernel_dtype,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
@@ -1131,7 +1139,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.head_v_dim,
             self.head_k_dim,
             device=device,
-            dtype=state_dtype,
+            dtype=kernel_dtype(state_dtype),
         )
         cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
 
@@ -1457,25 +1465,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
-                    a=a_spec,
-                    b=b_spec,
-                    dt_bias=self.dt_bias,
-                    q=query_spec,
-                    k=key_spec,
-                    v=value_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=spec_query_start_loc[  # type: ignore[index]
-                        : attn_metadata.num_spec_decodes
-                        + 1  # type: ignore[attr-defined]
-                    ],
-                    ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=num_accepted_tokens,
-                    use_qk_l2norm_in_kernel=True,
-                )
+            spec_update = (
+                damp_fused_update
+                if ssm_state.dtype == torch.uint8
+                else fused_sigmoid_gating_delta_rule_update
+            )
+            core_attn_out_spec, last_recurrent_state = spec_update(
+                A_log=self.A_log,
+                a=a_spec,
+                b=b_spec,
+                dt_bias=self.dt_bias,
+                q=query_spec,
+                k=key_spec,
+                v=value_spec,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=spec_query_start_loc[  # type: ignore[index]
+                    : attn_metadata.num_spec_decodes
+                    + 1  # type: ignore[attr-defined]
+                ],
+                ssm_state_indices=spec_state_indices_tensor,
+                num_accepted_tokens=num_accepted_tokens,
+                use_qk_l2norm_in_kernel=True,
             )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
@@ -1485,7 +1496,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
             )
-            core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
+            decode_update = (
+                damp_fused_update
+                if ssm_state.dtype == torch.uint8
+                else fused_sigmoid_gating_delta_rule_update
+            )
+            core_attn_out_decode, _ = decode_update(
                 A_log=self.A_log,
                 a=a[:num_decode_tokens],
                 b=b[:num_decode_tokens],
@@ -1514,7 +1530,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
+            initial_state = damp_read_rows(ssm_state, prefill_state_indices)
             initial_state[~prefill_has_initial_state, ...] = 0
             (
                 core_attn_out_non_spec,
@@ -1533,7 +1549,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
             )
             # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            damp_write_rows(ssm_state, prefill_state_indices, last_recurrent_state)
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
@@ -1542,24 +1558,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     [core_attn_out_decode, core_attn_out_non_spec], dim=1
                 )
         elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
-                    a=a,
-                    b=b,
-                    dt_bias=self.dt_bias,
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                        : attn_metadata.num_decodes
-                        + 1  # type: ignore[attr-defined]
-                    ],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
-                )
+            non_spec_update = (
+                damp_fused_update
+                if ssm_state.dtype == torch.uint8
+                else fused_sigmoid_gating_delta_rule_update
+            )
+            core_attn_out_non_spec, last_recurrent_state = non_spec_update(
+                A_log=self.A_log,
+                a=a,
+                b=b,
+                dt_bias=self.dt_bias,
+                q=query_non_spec,
+                k=key_non_spec,
+                v=value_non_spec,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                    : attn_metadata.num_decodes
+                    + 1  # type: ignore[attr-defined]
+                ],
+                ssm_state_indices=non_spec_state_indices_tensor,
+                use_qk_l2norm_in_kernel=True,
             )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
@@ -1627,6 +1646,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
         # 2. Recurrent attention
+        aiter_state, aiter_idx = damp_prepare(ssm_state, non_spec_state_indices_tensor)
         gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule(
             A_log=self.A_log,
             a=a,
@@ -1637,13 +1657,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             value_dim=self.value_dim // self.tp_size,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
-            initial_state=ssm_state,
+            initial_state=aiter_state,
             inplace_final_state=True,
             cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],  # type: ignore[index]
-            ssm_state_indices=non_spec_state_indices_tensor,
+            ssm_state_indices=aiter_idx,
             use_qk_l2norm_in_kernel=True,
             core_attn_out=core_attn_out.reshape(-1),
         )
+        damp_commit()
 
     def _forward_core_decode_non_spec(
         self,
@@ -1685,6 +1706,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             validate_data=False,
         )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        packed_idx = non_spec_state_indices_tensor[:num_actual_tokens]  # type: ignore[index]
+        packed_state, packed_idx = damp_prepare(ssm_state, packed_idx)
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
@@ -1692,11 +1715,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             scale=self.head_k_dim**-0.5,
-            initial_state=ssm_state,
+            initial_state=packed_state,
             out=out_buf,
-            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+            ssm_state_indices=packed_idx,
             use_qk_l2norm_in_kernel=True,
         )
+        damp_commit()
         return
 
     def _forward_core_decode_spec_fused_norm(

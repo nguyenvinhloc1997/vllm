@@ -124,9 +124,15 @@ class MambaStateDtypeCalculator:
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType = "auto",
     ) -> tuple[torch.dtype, torch.dtype]:
-        return cls._mamba_state_dtype(
+        dtypes = cls._mamba_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
+        from vllm.model_executor.layers.mamba.damp_pack import temporal_page
+
+        packed = temporal_page(48, 128)
+        if packed is None:
+            return dtypes
+        return (dtypes[0], packed[1])
 
     @classmethod
     def kda_state_dtype(
@@ -276,7 +282,12 @@ class MambaStateShapeCalculator:
             head_v_dim,
             head_k_dim,
         )
-        return conv_state_shape, temporal_state_shape
+        from vllm.model_executor.layers.mamba.damp_pack import temporal_page
+
+        packed = temporal_page(divide(num_v_heads, tp_world_size), head_k_dim)
+        if packed is None:
+            return conv_state_shape, temporal_state_shape
+        return conv_state_shape, packed[0]
 
     @classmethod
     def kda_state_shape(
