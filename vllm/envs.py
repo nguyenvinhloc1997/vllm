@@ -190,6 +190,8 @@ if TYPE_CHECKING:
     VLLM_NGM: bool = False
     VLLM_NGM_LAYERS: str = ""
     VLLM_NGM_SCALE: float = 0.1
+    VLLM_H2O: bool = False
+    VLLM_H2O_RATIO: float = 0.2
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
@@ -1513,6 +1515,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NGM": lambda: os.environ.get("VLLM_NGM", "0") == "1",
     "VLLM_NGM_LAYERS": lambda: os.environ.get("VLLM_NGM_LAYERS", ""),
     "VLLM_NGM_SCALE": lambda: float(os.environ.get("VLLM_NGM_SCALE", "0.1")),
+    "VLLM_H2O": lambda: os.environ.get("VLLM_H2O", "0") == "1",
+    "VLLM_H2O_RATIO": lambda: float(os.environ.get("VLLM_H2O_RATIO", "0.2")),
     # The activation dtype config for humming kernel
     "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
         os.environ.get("VLLM_HUMMING_INPUT_QUANT_CONFIG", None)
@@ -2344,6 +2348,9 @@ def compile_factors() -> dict[str, object]:
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
+        # H2O KV eviction policy; runtime-only, not compile graph shape.
+        "VLLM_H2O",
+        "VLLM_H2O_RATIO",
     }
 
     from vllm.config.utils import normalize_value
