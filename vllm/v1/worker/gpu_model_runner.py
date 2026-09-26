@@ -1215,10 +1215,9 @@ class GPUModelRunner(
             req_state = self.requests.pop(req_id, None)
             self._on_request_state_removed(req_id, req_state)
             self.num_prompt_logprobs.pop(req_id, None)
-            if vllm_envs.VLLM_H2O:
-                from vllm.v1.h2o.runtime import clear_h2o_runtime
+            from vllm.v1.h2o.runner_hooks import maybe_clear_h2o_runtime
 
-                clear_h2o_runtime(req_id)
+            maybe_clear_h2o_runtime(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -4180,40 +4179,15 @@ class GPUModelRunner(
         num_scheduled_tokens_np: np.ndarray,
     ) -> None:
         """Publish end-of-prefill gates for H2O FA compress (flag-gated)."""
-        if not vllm_envs.VLLM_H2O:
-            return
-        from vllm.v1.h2o.context import (
-            H2OBatchContext,
-            H2ORequestContext,
-            clear_h2o_batch_context,
-            set_h2o_batch_context,
-        )
+        from vllm.v1.h2o.runner_hooks import maybe_set_h2o_batch_context
 
-        clear_h2o_batch_context()
-        req_ctxs: list[H2ORequestContext] = []
-        # query_start_loc is [0, cumsum...]
-        q_start = self.query_start_loc.np
-        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            num_computed = int(self.input_batch.num_computed_tokens_cpu[i])
-            prompt_len = int(self.input_batch.num_prompt_tokens[i])
-            n_sched = int(num_scheduled_tokens_np[i])
-            is_last = num_computed < prompt_len and num_computed + n_sched >= prompt_len
-            token_start = int(q_start[i])
-            token_end = int(q_start[i + 1])
-            req_ctxs.append(
-                H2ORequestContext(
-                    request_id=req_id,
-                    num_computed_tokens=num_computed,
-                    prompt_len=prompt_len,
-                    is_last_prefill_chunk=is_last,
-                    token_start=token_start,
-                    token_end=token_end,
-                )
-            )
-        # positions may be mrope (2D); use first row / flat token axis.
-        pos_t = positions[0] if positions.ndim > 1 else positions
-        set_h2o_batch_context(
-            H2OBatchContext(requests=req_ctxs, positions=pos_t.detach())
+        maybe_set_h2o_batch_context(
+            req_ids=self.input_batch.req_ids[:num_reqs],
+            num_computed_tokens=self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            prompt_lens=self.input_batch.num_prompt_tokens[:num_reqs],
+            num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs],
+            query_start_loc_np=self.query_start_loc.np[: num_reqs + 1],
+            positions=positions,
         )
 
     def _maybe_remap_h2o_decode_slots(
@@ -4233,54 +4207,24 @@ class GPUModelRunner(
         """
         if not vllm_envs.VLLM_H2O:
             return
-        from vllm.v1.h2o.decode import next_decode_write_slot
-        from vllm.v1.h2o.pages import (
-            head_size_from_fa_kv_cache,
-            read_slot_kv,
-            split_fa_kv_cache,
-        )
-        from vllm.v1.h2o.runtime import get_h2o_runtime, stash_aged_slot_kv
+        from vllm.v1.h2o.runner_hooks import iter_h2o_decode_slot_remaps
         from vllm.v1.worker.block_table import SlotMappingMode
 
         block_tables = self.input_batch.block_table.block_tables
         if not block_tables:
             return
 
-        q_start = self.query_start_loc.np
-        forward_ctx = self.compilation_config.static_forward_context
-        changed = False
-        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            rt = get_h2o_runtime(req_id)
-            if rt is None or not rt.layers:
-                continue
-            num_computed = int(self.input_batch.num_computed_tokens_cpu[i])
-            if num_computed < rt.prompt_len:
-                continue  # still prefilling
-            layer_rt0 = next(iter(rt.layers.values()))
-            write_slot = next_decode_write_slot(layer_rt0)
-            # Stash aged KV on every FA layer (same circular head layout).
-            for layer_name, layer_rt in rt.layers.items():
-                attn = forward_ctx.get(layer_name)
-                if attn is None or not hasattr(attn, "kv_cache"):
-                    continue
-                kv = attn.kv_cache
-                if not isinstance(kv, torch.Tensor) or kv.numel() == 0:
-                    continue
-                head_size = head_size_from_fa_kv_cache(kv)
-                key_cache, value_cache = split_fa_kv_cache(kv, head_size)
-                aged_k, aged_v = read_slot_kv(
-                    key_cache,
-                    value_cache,
-                    write_slot
-                    if layer_rt is layer_rt0
-                    else next_decode_write_slot(layer_rt),
-                    block_size=layer_rt.layout.block_size,
-                )
-                stash_aged_slot_kv(layer_rt, key=aged_k, value=aged_v)
-            tok0 = int(q_start[i])
-            tok1 = int(q_start[i + 1])
-            if tok1 <= tok0:
-                continue
+        remaps = list(
+            iter_h2o_decode_slot_remaps(
+                req_ids=self.input_batch.req_ids[:num_reqs],
+                num_computed_tokens=self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                query_start_loc_np=self.query_start_loc.np[: num_reqs + 1],
+                forward_ctx=self.compilation_config.static_forward_context,
+            )
+        )
+        if not remaps:
+            return
+        for tok0, write_slot in remaps:
             for bt in block_tables:
                 if bt.slot_mapping_mode != SlotMappingMode.TOKEN_TO_KV_SLOT:
                     continue
@@ -4288,30 +4232,19 @@ class GPUModelRunner(
                 # Spec drafts share this slot until post-commit rewrite;
                 # do not widen DFlash num_query_per_req.
                 bt.slot_mapping.np[tok0] = write_slot
-                changed = True
-        if changed:
-            for bt in block_tables:
-                if bt.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT:
-                    bt.slot_mapping.copy_to_gpu(total_num_scheduled_tokens)
+        for bt in block_tables:
+            if bt.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT:
+                bt.slot_mapping.copy_to_gpu(total_num_scheduled_tokens)
 
     def _maybe_clamp_h2o_seq_lens(self, *, num_reqs: int) -> None:
         """Clamp FA seq_lens to retained KV length after Ownership-A."""
-        if not vllm_envs.VLLM_H2O:
-            return
-        from vllm.v1.h2o.runtime import get_h2o_runtime
-        from vllm.v1.h2o.seq_lens import clamp_h2o_seq_lens_inplace
+        from vllm.v1.h2o.runner_hooks import maybe_clamp_h2o_seq_lens
 
-        retained: dict[int, int] = {}
-        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            rt = get_h2o_runtime(req_id)
-            if rt is None or not rt.layers:
-                continue
-            layer_rt = next(iter(rt.layers.values()))
-            retained[i] = int(layer_rt.layout.num_keep)
-        if not retained:
-            return
-        clamp_h2o_seq_lens_inplace(self.seq_lens, req_retained=retained)
-        clamp_h2o_seq_lens_inplace(self.optimistic_seq_lens_cpu, req_retained=retained)
+        maybe_clamp_h2o_seq_lens(
+            self.input_batch.req_ids[:num_reqs],
+            self.seq_lens,
+            self.optimistic_seq_lens_cpu,
+        )
 
     def _get_slot_mappings(
         self,
@@ -4687,10 +4620,9 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
         finally:
-            if vllm_envs.VLLM_H2O:
-                from vllm.v1.h2o.context import clear_h2o_batch_context
+            from vllm.v1.h2o.runner_hooks import maybe_clear_h2o_batch_context
 
-                clear_h2o_batch_context()
+            maybe_clear_h2o_batch_context()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -5133,43 +5065,9 @@ class GPUModelRunner(
         victim overwrite on the real paged KV. Falls back to empty deltas (recent
         rotation only) when caches are missing.
         """
-        if not vllm_envs.VLLM_H2O or not commits:
-            return
-        from vllm.v1.h2o.decode import (
-            apply_committed_decode_step,
-            apply_committed_decode_step_with_cache,
-        )
-        from vllm.v1.h2o.pages import head_size_from_fa_kv_cache, split_fa_kv_cache
-        from vllm.v1.h2o.runtime import get_h2o_runtime
+        from vllm.v1.h2o.runner_hooks import h2o_decode_after_commit
 
-        forward_ctx = self.compilation_config.static_forward_context
-        for req_id, positions in commits.items():
-            rt = get_h2o_runtime(req_id)
-            if rt is None:
-                continue
-            for layer_name, layer_rt in rt.layers.items():
-                attn = forward_ctx.get(layer_name)
-                kv = getattr(attn, "kv_cache", None) if attn is not None else None
-                use_cache = isinstance(kv, torch.Tensor) and kv.numel() > 0
-                if use_cache:
-                    head_size = head_size_from_fa_kv_cache(kv)
-                    key_cache, value_cache = split_fa_kv_cache(kv, head_size)
-                    for pos in positions:
-                        apply_committed_decode_step_with_cache(
-                            layer_rt,
-                            new_pos=int(pos),
-                            key_cache=key_cache,
-                            value_cache=value_cache,
-                        )
-                else:
-                    for pos in positions:
-                        apply_committed_decode_step(
-                            layer_rt,
-                            new_pos=int(pos),
-                            new_scores_delta={},
-                        )
-                layer_rt.pending_decode_q = None
-                layer_rt.pending_decode_positions = []
+        h2o_decode_after_commit(commits, self.compilation_config.static_forward_context)
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
