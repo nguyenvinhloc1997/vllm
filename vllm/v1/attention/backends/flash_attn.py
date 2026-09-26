@@ -1186,6 +1186,7 @@ class FlashAttentionImpl(AttentionImpl):
                     aux_tensors=rswa_aux or mm_aux,
                 )
                 self._maybe_h2o_compress_after_attention(
+                    layer=layer,
                     query=query,
                     key=key,
                     value=value,
@@ -1222,6 +1223,7 @@ class FlashAttentionImpl(AttentionImpl):
             s_aux=self.sinks,
         )
         self._maybe_h2o_compress_after_attention(
+            layer=layer,
             query=query,
             key=key,
             value=value,
@@ -1269,6 +1271,7 @@ class FlashAttentionImpl(AttentionImpl):
     def _maybe_h2o_compress_after_attention(
         self,
         *,
+        layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor | None,
         value: torch.Tensor | None,
@@ -1287,6 +1290,8 @@ class FlashAttentionImpl(AttentionImpl):
         )
         from vllm.v1.h2o.context import get_h2o_batch_context
         from vllm.v1.h2o.ownership import num_keep_tokens
+        from vllm.v1.h2o.runtime import set_h2o_layer_runtime
+        from vllm.v1.h2o.slots import build_slot_layout
 
         ctx = get_h2o_batch_context()
         if ctx is None or not ctx.requests or ctx.positions is None:
@@ -1294,6 +1299,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         block_size = key_cache.shape[1]
+        layer_name = getattr(layer, "layer_name", None) or f"fa_{id(self)}"
 
         for req in ctx.requests:
             if not req.is_last_prefill_chunk:
@@ -1320,7 +1326,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
             if out is None:
                 continue
-            _state, k_out, v_out, _pos_out = out
+            state, k_out, v_out, pos_out = out
             slots = slot_mapping[req.token_start : req.token_end]
             keep_n = num_keep_tokens(req.prompt_len, float(envs.VLLM_H2O_RATIO))
             keep_slots = slots[:keep_n] if slots.numel() >= keep_n else slots
@@ -1341,6 +1347,14 @@ class FlashAttentionImpl(AttentionImpl):
                     value_cache=value_cache,
                     block_ids=block_ids,
                     block_size=block_size,
+                )
+                layout = build_slot_layout(pos_out, block_ids, block_size)
+                set_h2o_layer_runtime(
+                    req.request_id,
+                    layer_name=layer_name,
+                    state=state,
+                    layout=layout,
+                    prompt_len=req.prompt_len,
                 )
 
     def _forward_with_dcp(

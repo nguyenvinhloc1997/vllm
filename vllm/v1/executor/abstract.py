@@ -263,6 +263,12 @@ class Executor(ABC):
         output: list[DraftTokenIds] = self.collective_rpc("take_draft_token_ids")
         return output[0]
 
+    def h2o_decode_after_commit(self, commits: dict[str, list[int]]) -> None:
+        """H2O hook (d): per-step heavy update on committed decode tokens."""
+        if not commits:
+            return
+        self.collective_rpc("h2o_decode_after_commit", args=(commits,))
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.collective_rpc("profile", args=(is_start, profile_prefix))
 

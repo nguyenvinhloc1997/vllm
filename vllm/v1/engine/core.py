@@ -635,6 +635,16 @@ class EngineCore:
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
+        # H2O hook (d): after committed length is known, run per-step heavy
+        # updates on the worker. Does not change DFlash num_query_per_req.
+        if model_executed:
+            from vllm import envs as vllm_envs
+
+            if vllm_envs.VLLM_H2O:
+                commits = self.scheduler.take_h2o_decode_commits()  # type: ignore[attr-defined]
+                if commits:
+                    self.model_executor.h2o_decode_after_commit(commits)
+
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:

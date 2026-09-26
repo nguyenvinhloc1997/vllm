@@ -200,6 +200,9 @@ class Request:
         # via scheduled prefill tokens; consumed in update_from_output for
         # Ownership-A FA block-table resize.
         self.h2o_pending_resize = False
+        # Absolute positions of tokens committed this step (decode only).
+        # Cleared after EngineCore.post_step drains them to the worker.
+        self.h2o_committed_decode_positions: list[int] = []
 
         # Block-aligned token position of a proven shared prefix worth pinning
         # in the (sparse) prefix cache; 0 means none. Set at admission for

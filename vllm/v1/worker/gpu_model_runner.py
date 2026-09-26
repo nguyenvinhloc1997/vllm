@@ -1215,6 +1215,10 @@ class GPUModelRunner(
             req_state = self.requests.pop(req_id, None)
             self._on_request_state_removed(req_id, req_state)
             self.num_prompt_logprobs.pop(req_id, None)
+            if vllm_envs.VLLM_H2O:
+                from vllm.v1.h2o.runtime import clear_h2o_runtime
+
+                clear_h2o_runtime(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -2215,6 +2219,10 @@ class GPUModelRunner(
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
+        )
+        self._maybe_remap_h2o_decode_slots(
+            num_reqs=num_reqs,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
         )
 
         # Copy the tensors to the GPU.
@@ -4207,6 +4215,56 @@ class GPUModelRunner(
             H2OBatchContext(requests=req_ctxs, positions=pos_t.detach())
         )
 
+    def _maybe_remap_h2o_decode_slots(
+        self,
+        *,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+    ) -> None:
+        """Patch decode slot_mapping into the compressed 2K circular-recent slots.
+
+        After Ownership-A, absolute TOKEN_TO_KV_SLOT indices walk past the
+        truncated FA block table. Remap each decode write to the aged-out
+        recent head (paper circular buffer) so KV lands in-bounds.
+        """
+        if not vllm_envs.VLLM_H2O:
+            return
+        from vllm.v1.h2o.decode import next_decode_write_slot
+        from vllm.v1.h2o.runtime import get_h2o_runtime
+        from vllm.v1.worker.block_table import SlotMappingMode
+
+        block_tables = self.input_batch.block_table.block_tables
+        if not block_tables:
+            return
+
+        q_start = self.query_start_loc.np
+        changed = False
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            rt = get_h2o_runtime(req_id)
+            if rt is None or not rt.layers:
+                continue
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[i])
+            if num_computed < rt.prompt_len:
+                continue  # still prefilling
+            layer_rt = next(iter(rt.layers.values()))
+            write_slot = next_decode_write_slot(layer_rt)
+            tok0 = int(q_start[i])
+            tok1 = int(q_start[i + 1])
+            if tok1 <= tok0:
+                continue
+            for bt in block_tables:
+                if bt.slot_mapping_mode != SlotMappingMode.TOKEN_TO_KV_SLOT:
+                    continue
+                # Greedy decode: one new token → circular recent head.
+                # Spec drafts share this slot until post-commit rewrite;
+                # do not widen DFlash num_query_per_req.
+                bt.slot_mapping.np[tok0] = write_slot
+                changed = True
+        if changed:
+            for bt in block_tables:
+                if bt.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT:
+                    bt.slot_mapping.copy_to_gpu(total_num_scheduled_tokens)
+
     def _get_slot_mappings(
         self,
         num_tokens_padded: int,
@@ -5018,6 +5076,30 @@ class GPUModelRunner(
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
         return DraftTokenIds(req_ids, draft_token_ids)
+
+    def h2o_decode_after_commit(self, commits: dict[str, list[int]]) -> None:
+        """Apply paper Algorithm 1 decode_step for committed tokens only.
+
+        Score deltas default to empty when a GPU score gather is unavailable;
+        recent rotation + heavy eviction still run on retained scores. Full
+        S2 mass-from-pages after commit is a follow-up (see task-6 report).
+        """
+        if not vllm_envs.VLLM_H2O or not commits:
+            return
+        from vllm.v1.h2o.decode import apply_committed_decode_step
+        from vllm.v1.h2o.runtime import get_h2o_runtime
+
+        for req_id, positions in commits.items():
+            rt = get_h2o_runtime(req_id)
+            if rt is None:
+                continue
+            for layer_rt in rt.layers.values():
+                for pos in positions:
+                    apply_committed_decode_step(
+                        layer_rt,
+                        new_pos=int(pos),
+                        new_scores_delta={},
+                    )
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False

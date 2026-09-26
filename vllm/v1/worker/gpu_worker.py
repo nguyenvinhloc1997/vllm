@@ -1203,6 +1203,9 @@ class Worker(WorkerBase):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
+    def h2o_decode_after_commit(self, commits: dict[str, list[int]]) -> None:
+        self.model_runner.h2o_decode_after_commit(commits)
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled
         if self.profiler_config is None or self.profiler_config.profiler is None:

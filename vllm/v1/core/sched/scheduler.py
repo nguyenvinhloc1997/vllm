@@ -1808,6 +1808,23 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    def take_h2o_decode_commits(self) -> dict[str, list[int]]:
+        """Drain per-request committed decode positions for H2O post_step.
+
+        Returns:
+            ``{request_id: [absolute_pos, ...]}`` for requests that committed
+            at least one decode token this step. Empty when ``VLLM_H2O`` is off.
+        """
+        if not envs.VLLM_H2O:
+            return {}
+        out: dict[str, list[int]] = {}
+        for req_id, request in self.requests.items():
+            positions = request.h2o_committed_decode_positions
+            if positions:
+                out[req_id] = list(positions)
+                request.h2o_committed_decode_positions = []
+        return out
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -2001,6 +2018,21 @@ class Scheduler(SchedulerInterface):
                 # a consumed prompt also means every item in it was encoded.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            # H2O decode: record committed absolute positions for post_step.
+            # Spec rejections already rolled back num_computed_tokens; only
+            # accepted (post-stop) tokens are scored — never draft-only.
+            request.h2o_committed_decode_positions = []
+            if (
+                envs.VLLM_H2O
+                and new_token_ids
+                and request.num_computed_tokens > request.num_prompt_tokens
+            ):
+                n_commit = len(new_token_ids)
+                end = request.num_computed_tokens
+                start = end - n_commit
+                if start >= request.num_prompt_tokens:
+                    request.h2o_committed_decode_positions = list(range(start, end))
 
             if new_token_ids and self.structured_output_manager.should_advance(
                 request, new_token_ids=new_token_ids

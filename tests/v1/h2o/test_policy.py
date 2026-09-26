@@ -44,3 +44,26 @@ def test_decode_step_rotates_recent_and_evicts_weak_heavy():
     assert out.heavy == [1, 8]
     assert 3 not in out.heavy
     assert out.scores[1] == pytest.approx(10.5)
+
+
+def test_decode_step_five_times_keeps_budget():
+    """5× decode_step from a prefill state: len(heavy)==k and len(recent)==k."""
+    prompt_len = 20
+    k = 4
+    scores = {i: float(20 - i) for i in range(prompt_len)}
+    state = select_prefill(scores, prompt_len, k)
+    assert len(state.heavy) == k
+    assert len(state.recent) == k
+    assert state.recent == list(range(prompt_len - k, prompt_len))
+
+    pos = prompt_len
+    for step in range(5):
+        # Favor early heavies so eviction targets aged-out recent often.
+        delta = {p: 0.1 for p in (set(state.heavy) | set(state.recent))}
+        delta[pos] = 0.0
+        state = decode_step(state, new_pos=pos, new_scores_delta=delta)
+        assert len(state.heavy) == k, f"step {step}: heavy={state.heavy}"
+        assert len(state.recent) == k, f"step {step}: recent={state.recent}"
+        assert state.recent[-1] == pos
+        assert set(state.scores) == set(state.heavy) | set(state.recent)
+        pos += 1
