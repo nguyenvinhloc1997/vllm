@@ -1290,7 +1290,12 @@ class FlashAttentionImpl(AttentionImpl):
         )
         from vllm.v1.h2o.context import get_h2o_batch_context
         from vllm.v1.h2o.ownership import num_keep_tokens
-        from vllm.v1.h2o.runtime import set_h2o_layer_runtime
+        from vllm.v1.h2o.runtime import (
+            get_h2o_runtime,
+            get_or_create_prefill_mass,
+            set_h2o_layer_runtime,
+            stash_decode_queries,
+        )
         from vllm.v1.h2o.slots import build_slot_layout
 
         ctx = get_h2o_batch_context()
@@ -1302,43 +1307,92 @@ class FlashAttentionImpl(AttentionImpl):
         layer_name = getattr(layer, "layer_name", None) or f"fa_{id(self)}"
 
         for req in ctx.requests:
-            if not req.is_last_prefill_chunk:
-                continue
-            # After this KV write, prompt tokens are fully computed.
-            num_computed = req.prompt_len
             q = query[req.token_start : req.token_end]
             k = key[req.token_start : req.token_end]
             v = value[req.token_start : req.token_end]
-            # Only compress when this forward's tokens cover the full prompt
-            # (single-chunk prefill). Multi-chunk page-gather is Task 5b+.
-            if q.shape[0] != req.prompt_len:
-                continue
             pos = ctx.positions[req.token_start : req.token_end].tolist()
-            out = after_full_attention_kv_update(
-                key=k,
-                value=v,
-                query=q,
-                positions=pos,
-                is_last_prefill_chunk=True,
-                num_computed_tokens=num_computed,
+
+            # Decode: stash Q for post-commit score deltas (committed only).
+            if req.num_computed_tokens >= req.prompt_len:
+                rt = get_h2o_runtime(req.request_id)
+                if rt is not None and layer_name in rt.layers:
+                    stash_decode_queries(
+                        req.request_id,
+                        layer_name=layer_name,
+                        q=q,
+                        positions=pos,
+                    )
+                continue
+
+            # Prefill chunks: accumulate S2 mass (+ buffer K/V) every tile.
+            mass_acc = get_or_create_prefill_mass(
+                req.request_id,
+                layer_name=layer_name,
                 prompt_len=req.prompt_len,
-                sliding_window=self.sliding_window,
             )
+            slots = slot_mapping[req.token_start : req.token_end]
+            mass_acc.note_slots(slots.tolist(), block_size=block_size)
+            mass_acc.update(
+                q,
+                k,
+                q_positions=pos,
+                k_positions=pos,
+                scale=self.scale,
+                v=v,
+            )
+
+            if not req.is_last_prefill_chunk:
+                continue
+
+            # End-of-prefill: single-chunk uses live Q/K/V; multi-chunk uses
+            # the buffered full-prompt K/V + accumulated mass.
+            if q.shape[0] == req.prompt_len:
+                out = after_full_attention_kv_update(
+                    key=k,
+                    value=v,
+                    query=q,
+                    positions=pos,
+                    is_last_prefill_chunk=True,
+                    num_computed_tokens=req.prompt_len,
+                    prompt_len=req.prompt_len,
+                    sliding_window=self.sliding_window,
+                )
+            else:
+                full = mass_acc.full_kv()
+                if full is None:
+                    continue
+                k_full, v_full, pos_full = full
+                out = after_full_attention_kv_update(
+                    key=k_full,
+                    value=v_full,
+                    query=None,
+                    positions=pos_full,
+                    is_last_prefill_chunk=True,
+                    num_computed_tokens=req.prompt_len,
+                    prompt_len=req.prompt_len,
+                    sliding_window=self.sliding_window,
+                    mass=mass_acc.mass,
+                )
             if out is None:
                 continue
             state, k_out, v_out, pos_out = out
-            slots = slot_mapping[req.token_start : req.token_end]
             keep_n = num_keep_tokens(req.prompt_len, float(envs.VLLM_H2O_RATIO))
-            keep_slots = slots[:keep_n] if slots.numel() >= keep_n else slots
-            block_ids: list[int] = []
-            seen: set[int] = set()
-            for s in keep_slots.tolist():
-                if s < 0:
-                    continue
-                bid = int(s) // block_size
-                if bid not in seen:
-                    seen.add(bid)
-                    block_ids.append(bid)
+            need_blocks = (keep_n + block_size - 1) // block_size if keep_n else 0
+            # Prefer blocks observed across all chunks (leading pages after
+            # Ownership-A); fall back to this forward's slots only.
+            block_ids = list(mass_acc.block_ids[:need_blocks])
+            if len(block_ids) < need_blocks:
+                seen = set(block_ids)
+                for s in slots.tolist():
+                    if s < 0:
+                        continue
+                    bid = int(s) // block_size
+                    if bid not in seen:
+                        seen.add(bid)
+                        block_ids.append(bid)
+                    if len(block_ids) >= need_blocks:
+                        break
+            block_ids = block_ids[:need_blocks]
             if block_ids:
                 repack_kv_into_pages(
                     k_out,

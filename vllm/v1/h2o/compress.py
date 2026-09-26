@@ -141,13 +141,71 @@ def is_full_attention_sliding_window(
 
 @dataclass
 class PrefillMassAccumulator:
-    """Accumulate S2 mass across chunked-prefill tiles for one request/layer."""
+    """Accumulate S2 mass across chunked-prefill tiles for one request/layer.
+
+    Buffers K/V by absolute (or local) position so the last chunk can compress
+    from the full prompt without a second page gather when callers stream
+    chunk tensors. Mass for each chunk is scored against all keys buffered so
+    far (causal via absolute positions).
+    """
 
     prompt_len: int
     mass: torch.Tensor = field(init=False)
+    k_buf: torch.Tensor | None = field(default=None, init=False, repr=False)
+    v_buf: torch.Tensor | None = field(default=None, init=False, repr=False)
+    filled: torch.Tensor = field(init=False, repr=False)
+    # Physical FA block ids observed across chunks (order preserved).
+    block_ids: list[int] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         self.mass = torch.zeros(self.prompt_len, dtype=torch.float32)
+        self.filled = torch.zeros(self.prompt_len, dtype=torch.bool)
+        self.block_ids = []
+
+    def note_slots(self, slots: list[int], *, block_size: int) -> None:
+        """Record physical block ids touched by this chunk's slot_mapping."""
+        seen = set(self.block_ids)
+        for s in slots:
+            if s < 0:
+                continue
+            bid = int(s) // block_size
+            if bid not in seen:
+                seen.add(bid)
+                self.block_ids.append(bid)
+
+    def _ensure_kv_buffers(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        if self.k_buf is not None:
+            return
+        h, d = k.shape[1], k.shape[2]
+        self.k_buf = torch.zeros(self.prompt_len, h, d, device=k.device, dtype=k.dtype)
+        self.v_buf = torch.zeros(self.prompt_len, h, d, device=v.device, dtype=v.dtype)
+        self.filled = self.filled.to(device=k.device)
+
+    def _local_index(self, pos: int, order_i: int) -> int | None:
+        if 0 <= pos < self.prompt_len:
+            return pos
+        if 0 <= order_i < self.prompt_len:
+            return order_i
+        return None
+
+    def buffer_kv(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: list[int],
+    ) -> None:
+        """Store this chunk's K/V into the prompt-sized buffers."""
+        if len(positions) != k.shape[0] or k.shape[0] != v.shape[0]:
+            raise ValueError("k/v/positions length mismatch")
+        self._ensure_kv_buffers(k, v)
+        assert self.k_buf is not None and self.v_buf is not None
+        for i, pos in enumerate(positions):
+            idx = self._local_index(int(pos), i)
+            if idx is None:
+                continue
+            self.k_buf[idx].copy_(k[i])
+            self.v_buf[idx].copy_(v[i])
+            self.filled[idx] = True
 
     def update(
         self,
@@ -159,12 +217,33 @@ class PrefillMassAccumulator:
         scale: float | None = None,
         tile_q: int = 64,
         tile_k: int = 64,
+        v: torch.Tensor | None = None,
     ) -> None:
         if scale is None:
             scale = q.shape[-1] ** -0.5
-        # k covers keys 0..len(k_positions); mass buffer is prompt-sized.
         if len(k_positions) > self.prompt_len:
             raise ValueError("k_positions exceed prompt_len")
+        if v is not None:
+            self.buffer_kv(k, v, k_positions)
+            # Score chunk Q against all keys buffered so far.
+            filled_idx = self.filled.nonzero(as_tuple=False).flatten().tolist()
+            if not filled_idx:
+                return
+            assert self.k_buf is not None
+            k_all = self.k_buf[filled_idx]
+            chunk_mass = accumulate_attention_mass_chunked(
+                q,
+                k_all,
+                scale=scale,
+                tile_q=tile_q,
+                tile_k=tile_k,
+                q_positions=q_positions,
+                k_positions=filled_idx,
+            )
+            for i, pos in enumerate(filled_idx):
+                self.mass[pos] += chunk_mass[i]
+            return
+
         chunk_mass = accumulate_attention_mass_chunked(
             q,
             k,
@@ -175,15 +254,20 @@ class PrefillMassAccumulator:
             k_positions=k_positions,
         )
         for i, pos in enumerate(k_positions):
-            # Map absolute position into [0, prompt_len) local index.
-            # Callers that use 0..T-1 positions pass identity.
-            if 0 <= pos < self.prompt_len:
-                self.mass[pos] += chunk_mass[i]
-            elif pos != i:
-                # Absolute RoPE positions outside 0..prompt_len-1: index by order.
-                self.mass[i] += chunk_mass[i]
-            else:
-                self.mass[i] += chunk_mass[i]
+            idx = self._local_index(int(pos), i)
+            if idx is not None:
+                self.mass[idx] += chunk_mass[i]
+
+    def full_kv(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]] | None:
+        """Return dense prompt K/V when every position has been buffered."""
+        if self.k_buf is None or self.v_buf is None:
+            return None
+        if not bool(self.filled.all().item()):
+            return None
+        positions = list(range(self.prompt_len))
+        return self.k_buf, self.v_buf, positions
 
 
 def repack_kv_into_pages(

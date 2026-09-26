@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import torch
+
+from vllm.v1.h2o.compress import PrefillMassAccumulator
 from vllm.v1.h2o.policy import H2OState
 from vllm.v1.h2o.slots import SlotLayout
 
@@ -16,6 +19,12 @@ from vllm.v1.h2o.slots import SlotLayout
 class H2OLayerRuntime:
     state: H2OState
     layout: SlotLayout
+    # Circular-recent slot KV captured before remapped FA decode overwrite.
+    stashed_aged_key: torch.Tensor | None = None  # [H_kv, D]
+    stashed_aged_value: torch.Tensor | None = None
+    # Last forward's decode queries (for committed-token score deltas).
+    pending_decode_q: torch.Tensor | None = None  # [T_q, H_q, D]
+    pending_decode_positions: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -26,6 +35,8 @@ class H2ORequestRuntime:
     layers: dict[str, H2OLayerRuntime] = field(default_factory=dict)
     # Absolute positions of decode tokens committed since last maintenance.
     pending_committed_positions: list[int] = field(default_factory=list)
+    # layer_name → chunked-prefill mass accumulator (cleared after compress).
+    prefill_mass: dict[str, PrefillMassAccumulator] = field(default_factory=dict)
 
 
 _RUNTIME: dict[str, H2ORequestRuntime] = {}
@@ -33,6 +44,16 @@ _RUNTIME: dict[str, H2ORequestRuntime] = {}
 
 def get_h2o_runtime(request_id: str) -> H2ORequestRuntime | None:
     return _RUNTIME.get(request_id)
+
+
+def get_or_create_h2o_request_runtime(
+    request_id: str, *, prompt_len: int
+) -> H2ORequestRuntime:
+    rt = _RUNTIME.get(request_id)
+    if rt is None:
+        rt = H2ORequestRuntime(request_id=request_id, prompt_len=prompt_len)
+        _RUNTIME[request_id] = rt
+    return rt
 
 
 def set_h2o_layer_runtime(
@@ -43,12 +64,21 @@ def set_h2o_layer_runtime(
     layout: SlotLayout,
     prompt_len: int,
 ) -> H2ORequestRuntime:
-    rt = _RUNTIME.get(request_id)
-    if rt is None:
-        rt = H2ORequestRuntime(request_id=request_id, prompt_len=prompt_len)
-        _RUNTIME[request_id] = rt
+    rt = get_or_create_h2o_request_runtime(request_id, prompt_len=prompt_len)
     rt.layers[layer_name] = H2OLayerRuntime(state=state, layout=layout)
+    rt.prefill_mass.pop(layer_name, None)
     return rt
+
+
+def get_or_create_prefill_mass(
+    request_id: str, *, layer_name: str, prompt_len: int
+) -> PrefillMassAccumulator:
+    rt = get_or_create_h2o_request_runtime(request_id, prompt_len=prompt_len)
+    acc = rt.prefill_mass.get(layer_name)
+    if acc is None or acc.prompt_len != prompt_len:
+        acc = PrefillMassAccumulator(prompt_len=prompt_len)
+        rt.prefill_mass[layer_name] = acc
+    return acc
 
 
 def clear_h2o_runtime(request_id: str) -> None:
@@ -65,3 +95,32 @@ def note_committed_decode_positions(request_id: str, positions: list[int]) -> No
     if rt is None:
         return
     rt.pending_committed_positions.extend(int(p) for p in positions)
+
+
+def stash_decode_queries(
+    request_id: str,
+    *,
+    layer_name: str,
+    q: torch.Tensor,
+    positions: list[int],
+) -> None:
+    """Store this forward's decode Q for post-commit scoring (flag path)."""
+    rt = _RUNTIME.get(request_id)
+    if rt is None:
+        return
+    layer_rt = rt.layers.get(layer_name)
+    if layer_rt is None:
+        return
+    layer_rt.pending_decode_q = q.detach()
+    layer_rt.pending_decode_positions = [int(p) for p in positions]
+
+
+def stash_aged_slot_kv(
+    layer_rt: H2OLayerRuntime,
+    *,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> None:
+    """Capture circular-recent KV before remapped FA overwrite."""
+    layer_rt.stashed_aged_key = key.detach().clone()
+    layer_rt.stashed_aged_value = value.detach().clone()
