@@ -105,6 +105,10 @@ class SingleTypeKVCacheManager(ABC):
         # data for preempted ones.
         self.num_cached_block: dict[str, int] = {}
 
+        # Ownership-A H2O: after prefill compress, FA groups hold a fixed
+        # ``num_keep`` token budget; allocate must not re-grow the table.
+        self.h2o_num_tokens: dict[str, int] = {}
+
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
 
@@ -178,6 +182,11 @@ class SingleTypeKVCacheManager(ABC):
         Returns:
             The number of blocks to allocate.
         """
+
+        # H2O Ownership-A: compressed FA cache is fixed-size (decode overwrites
+        # in place). Do not request blocks beyond the kept budget.
+        if request_id in self.h2o_num_tokens:
+            return 0
 
         num_required_blocks = cdiv(num_tokens, self.block_size)
         if apply_admission_cap and self._max_admission_blocks_per_request is not None:
@@ -361,6 +370,10 @@ class SingleTypeKVCacheManager(ABC):
             self.new_block_ids.append(cow_block.block_id)
             cow_blocks.append(cow_block)
 
+        # H2O Ownership-A: do not grow past the compressed budget.
+        if request_id in self.h2o_num_tokens:
+            return cow_blocks
+
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
         num_new_blocks = num_required_blocks - len(req_blocks)
@@ -519,6 +532,7 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        self.h2o_num_tokens.pop(request_id, None)
         return req_blocks
 
     def free(self, request_id: str) -> None:
@@ -687,6 +701,42 @@ class SingleTypeKVCacheManager(ABC):
 
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+
+    def resize_after_h2o_compress(self, request_id: str, num_keep_tokens: int) -> int:
+        """Ownership-A: truncate FA block table to ``ceil(num_keep / block_size)``.
+
+        Frees unused trailing blocks back to the pool. Idempotent. Subsequent
+        ``allocate_new_blocks`` / ``get_num_blocks_to_allocate`` return no new
+        blocks for this request (fixed 2K budget; decode overwrites in place).
+
+        Returns:
+            Number of blocks retained.
+        """
+        if request_id not in self.req_to_blocks:
+            return 0
+        if num_keep_tokens < 0:
+            raise ValueError("num_keep_tokens must be non-negative")
+        num_keep_blocks = (
+            cdiv(num_keep_tokens, self.block_size) if num_keep_tokens else 0
+        )
+        blocks = self.req_to_blocks[request_id]
+        if request_id in self.h2o_num_tokens:
+            # Already compressed; ensure length matches.
+            return len(blocks)
+
+        if len(blocks) > num_keep_blocks:
+            freed = blocks[num_keep_blocks:]
+            del blocks[num_keep_blocks:]
+            # Free tail first so newly-evictable blocks hit the free queue order
+            # consistent with remove_skipped / free().
+            self.block_pool.free_blocks(reversed(freed))
+
+        if request_id in self.num_cached_block:
+            self.num_cached_block[request_id] = min(
+                self.num_cached_block[request_id], len(blocks)
+            )
+        self.h2o_num_tokens[request_id] = num_keep_tokens
+        return len(blocks)
 
     @classmethod
     def find_longest_cache_hit(

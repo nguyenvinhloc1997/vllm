@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -1458,6 +1459,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            was_below_prompt = request.num_computed_tokens < request.num_prompt_tokens
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
@@ -1465,6 +1467,13 @@ class Scheduler(SchedulerInterface):
                 request.last_sched_seq = self.sched_step_seq
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
+            )
+            # H2O: mark the step that first reaches prompt_len via scheduled
+            # prefill tokens (not a prefix-cache full hit).
+            request.h2o_pending_resize = bool(
+                envs.VLLM_H2O
+                and was_below_prompt
+                and request.num_computed_tokens >= request.num_prompt_tokens
             )
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
@@ -1915,6 +1924,10 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
                         request.num_output_placeholders -= num_rejected
+                    # Spec rejection may roll the request back into prefill;
+                    # do not Ownership-A resize on a incomplete prompt.
+                    if request.num_computed_tokens < request.num_prompt_tokens:
+                        request.h2o_pending_resize = False
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -1936,6 +1949,22 @@ class Scheduler(SchedulerInterface):
                         num_accepted=num_accepted,
                         detailed=self.spec_decode_metrics_level == "detailed",
                     )
+
+            # H2O Ownership-A: after the step that finishes the prompt, shrink
+            # full-attention block tables to ceil(2K/block_size). Worker
+            # repacks kept KV into the leading pages during that same step.
+            # Flag is set in _update_after_schedule only when scheduled tokens
+            # cross prompt_len (skips prefix-cache full hits).
+            if request.h2o_pending_resize:
+                from vllm.v1.h2o.ownership import num_keep_tokens
+
+                self.kv_cache_manager.resize_h2o_full_attention(
+                    req_id,
+                    num_keep_tokens(
+                        request.num_prompt_tokens, float(envs.VLLM_H2O_RATIO)
+                    ),
+                )
+                request.h2o_pending_resize = False
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:

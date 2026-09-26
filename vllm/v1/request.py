@@ -196,6 +196,10 @@ class Request:
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
+        # Set in _update_after_schedule when this step first reaches prompt_len
+        # via scheduled prefill tokens; consumed in update_from_output for
+        # Ownership-A FA block-table resize.
+        self.h2o_pending_resize = False
 
         # Block-aligned token position of a proven shared prefix worth pinning
         # in the (sparse) prefix cache; 0 means none. Set at admission for

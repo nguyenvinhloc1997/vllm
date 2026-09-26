@@ -1185,6 +1185,13 @@ class FlashAttentionImpl(AttentionImpl):
                     mask_mod=rswa_mask_mod_fn or mm_mask_mod,
                     aux_tensors=rswa_aux or mm_aux,
                 )
+                self._maybe_h2o_compress_after_attention(
+                    query=query,
+                    key=key,
+                    value=value,
+                    kv_cache=kv_cache,
+                    slot_mapping=attn_metadata.slot_mapping,
+                )
                 return output
 
         # Cascade attention (rare case).
@@ -1213,6 +1220,13 @@ class FlashAttentionImpl(AttentionImpl):
             k_descale=layer._k_scale,
             v_descale=layer._v_scale,
             s_aux=self.sinks,
+        )
+        self._maybe_h2o_compress_after_attention(
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            slot_mapping=attn_metadata.slot_mapping,
         )
         return output
 
@@ -1252,18 +1266,82 @@ class FlashAttentionImpl(AttentionImpl):
             layer._v_scale,
         )
 
-        # H2O hook (b): after full-attention KV write. Prefill compress runs
-        # when the runner later supplies end-of-prefill Q + absolute positions
-        # via after_full_attention_kv_update; Ownership-A block resize is
-        # deferred. Flag-off path is a single env check.
-        if envs.VLLM_H2O and self.sliding_window[0] < 0 and self.sliding_window[1] < 0:
-            from vllm.v1.h2o.compress import after_full_attention_kv_update
+    def _maybe_h2o_compress_after_attention(
+        self,
+        *,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if not envs.VLLM_H2O:
+            return
+        if self.sliding_window[0] >= 0 or self.sliding_window[1] >= 0:
+            return
+        if key is None or value is None:
+            return
+        from vllm.v1.h2o.compress import (
+            after_full_attention_kv_update,
+            repack_kv_into_pages,
+        )
+        from vllm.v1.h2o.context import get_h2o_batch_context
+        from vllm.v1.h2o.ownership import num_keep_tokens
 
-            after_full_attention_kv_update(
-                key=key,
-                value=value,
+        ctx = get_h2o_batch_context()
+        if ctx is None or not ctx.requests or ctx.positions is None:
+            return
+
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        block_size = key_cache.shape[1]
+
+        for req in ctx.requests:
+            if not req.is_last_prefill_chunk:
+                continue
+            # After this KV write, prompt tokens are fully computed.
+            num_computed = req.prompt_len
+            q = query[req.token_start : req.token_end]
+            k = key[req.token_start : req.token_end]
+            v = value[req.token_start : req.token_end]
+            # Only compress when this forward's tokens cover the full prompt
+            # (single-chunk prefill). Multi-chunk page-gather is Task 5b+.
+            if q.shape[0] != req.prompt_len:
+                continue
+            pos = ctx.positions[req.token_start : req.token_end].tolist()
+            out = after_full_attention_kv_update(
+                key=k,
+                value=v,
+                query=q,
+                positions=pos,
+                is_last_prefill_chunk=True,
+                num_computed_tokens=num_computed,
+                prompt_len=req.prompt_len,
                 sliding_window=self.sliding_window,
             )
+            if out is None:
+                continue
+            _state, k_out, v_out, _pos_out = out
+            slots = slot_mapping[req.token_start : req.token_end]
+            keep_n = num_keep_tokens(req.prompt_len, float(envs.VLLM_H2O_RATIO))
+            keep_slots = slots[:keep_n] if slots.numel() >= keep_n else slots
+            block_ids: list[int] = []
+            seen: set[int] = set()
+            for s in keep_slots.tolist():
+                if s < 0:
+                    continue
+                bid = int(s) // block_size
+                if bid not in seen:
+                    seen.add(bid)
+                    block_ids.append(bid)
+            if block_ids:
+                repack_kv_into_pages(
+                    k_out,
+                    v_out,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_ids=block_ids,
+                    block_size=block_size,
+                )
 
     def _forward_with_dcp(
         self,

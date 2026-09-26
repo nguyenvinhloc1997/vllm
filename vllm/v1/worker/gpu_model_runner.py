@@ -21,6 +21,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm import envs as vllm_envs
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -4162,6 +4163,50 @@ class GPUModelRunner(
                 pyt_hooks.register_hooks(self.model, self.model.__class__.__name__)
                 self.layerwise_nvtx_hooks_registered = True
 
+    def _maybe_set_h2o_batch_context(
+        self,
+        *,
+        num_reqs: int,
+        positions: torch.Tensor,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> None:
+        """Publish end-of-prefill gates for H2O FA compress (flag-gated)."""
+        if not vllm_envs.VLLM_H2O:
+            return
+        from vllm.v1.h2o.context import (
+            H2OBatchContext,
+            H2ORequestContext,
+            clear_h2o_batch_context,
+            set_h2o_batch_context,
+        )
+
+        clear_h2o_batch_context()
+        req_ctxs: list[H2ORequestContext] = []
+        # query_start_loc is [0, cumsum...]
+        q_start = self.query_start_loc.np
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            num_computed = int(self.input_batch.num_computed_tokens_cpu[i])
+            prompt_len = int(self.input_batch.num_prompt_tokens[i])
+            n_sched = int(num_scheduled_tokens_np[i])
+            is_last = num_computed < prompt_len and num_computed + n_sched >= prompt_len
+            token_start = int(q_start[i])
+            token_end = int(q_start[i + 1])
+            req_ctxs.append(
+                H2ORequestContext(
+                    request_id=req_id,
+                    num_computed_tokens=num_computed,
+                    prompt_len=prompt_len,
+                    is_last_prefill_chunk=is_last,
+                    token_start=token_start,
+                    token_end=token_end,
+                )
+            )
+        # positions may be mrope (2D); use first row / flat token axis.
+        pos_t = positions[0] if positions.ndim > 1 else positions
+        set_h2o_batch_context(
+            H2OBatchContext(requests=req_ctxs, positions=pos_t.detach())
+        )
+
     def _get_slot_mappings(
         self,
         num_tokens_padded: int,
@@ -4504,31 +4549,42 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+        self._maybe_set_h2o_batch_context(
+            num_reqs=num_reqs,
+            positions=positions,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+        )
+        try:
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=has_encoder_input,
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    defer_finalize=defer_kv_connector_finalize,
+                ) as kv_connector_output,
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+        finally:
+            if vllm_envs.VLLM_H2O:
+                from vllm.v1.h2o.context import clear_h2o_batch_context
+
+                clear_h2o_batch_context()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

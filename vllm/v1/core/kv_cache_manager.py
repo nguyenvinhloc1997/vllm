@@ -592,6 +592,10 @@ class KVCacheManager:
             request_id, processed_computed_tokens, num_prompt_tokens
         )
 
+    def resize_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
+        """Ownership-A: shrink full-attention groups to ``ceil(2K/block_size)``."""
+        self.coordinator.resize_h2o_full_attention(request_id, num_keep_tokens)
+
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping and return its blocks without
         returning them to the block pool. The caller must eventually free

@@ -394,6 +394,19 @@ class KVCacheCoordinator(ABC):
                 request_id, processed_computed_tokens, num_prompt_tokens
             )
 
+    def resize_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
+        """Ownership-A: resize each full-attention group; skip GDN/Mamba/SWA."""
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        for manager in self.single_type_managers:
+            if not isinstance(manager, FullAttentionManager):
+                continue
+            # Exact FullAttentionSpec only (not chunked-local / MLA / sink).
+            if type(manager.kv_cache_spec) is not FullAttentionSpec:
+                continue
+            manager.resize_after_h2o_compress(request_id, num_keep_tokens)
+
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """
         Get the blocks for the request.
