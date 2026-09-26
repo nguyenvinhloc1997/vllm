@@ -153,8 +153,8 @@ def test_multi_chunk_mass_accumulate_then_final_compress():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_prefill_mass_moves_to_q_device():
-    """Live KVarN/FA path: mass starts CPU; first GPU update must not raise."""
+def test_prefill_mass_stays_on_cpu_when_q_is_cuda():
+    """Live path must not park full-prompt K/V/mass on the 3090."""
     torch.manual_seed(0)
     prompt_len, h_kv, h_q, d = 8, 1, 2, 4
     device = torch.device("cuda")
@@ -162,7 +162,6 @@ def test_prefill_mass_moves_to_q_device():
     k = torch.randn(prompt_len, h_kv, d, device=device)
     v = torch.randn(prompt_len, h_kv, d, device=device)
     acc = PrefillMassAccumulator(prompt_len=prompt_len)
-    assert acc.mass.device.type == "cpu"
     acc.update(
         q,
         k,
@@ -172,7 +171,8 @@ def test_prefill_mass_moves_to_q_device():
         tile_q=4,
         tile_k=4,
     )
-    assert acc.mass.device.type == "cuda"
+    assert acc.mass.device.type == "cpu"
+    assert acc.k_buf is not None and acc.k_buf.device.type == "cpu"
     assert float(acc.mass.sum().item()) > 0
 
 

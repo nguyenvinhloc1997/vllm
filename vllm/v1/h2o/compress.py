@@ -177,9 +177,10 @@ class PrefillMassAccumulator:
         if self.k_buf is not None:
             return
         h, d = k.shape[1], k.shape[2]
-        self.k_buf = torch.zeros(self.prompt_len, h, d, device=k.device, dtype=k.dtype)
-        self.v_buf = torch.zeros(self.prompt_len, h, d, device=v.device, dtype=v.dtype)
-        self.filled = self.filled.to(device=k.device)
+        # Host-side buffers: live CTX=huge already pins the 3090; keeping a
+        # full-prompt K/V copy per FA layer on GPU OOMs during chunked prefill.
+        self.k_buf = torch.zeros(self.prompt_len, h, d, device="cpu", dtype=k.dtype)
+        self.v_buf = torch.zeros(self.prompt_len, h, d, device="cpu", dtype=v.dtype)
 
     def _local_index(self, pos: int, order_i: int) -> int | None:
         if 0 <= pos < self.prompt_len:
@@ -194,17 +195,19 @@ class PrefillMassAccumulator:
         v: torch.Tensor,
         positions: list[int],
     ) -> None:
-        """Store this chunk's K/V into the prompt-sized buffers."""
+        """Store this chunk's K/V into the prompt-sized buffers (CPU)."""
         if len(positions) != k.shape[0] or k.shape[0] != v.shape[0]:
             raise ValueError("k/v/positions length mismatch")
         self._ensure_kv_buffers(k, v)
         assert self.k_buf is not None and self.v_buf is not None
+        k_cpu = k.detach().to("cpu")
+        v_cpu = v.detach().to("cpu")
         for i, pos in enumerate(positions):
             idx = self._local_index(int(pos), i)
             if idx is None:
                 continue
-            self.k_buf[idx].copy_(k[i])
-            self.v_buf[idx].copy_(v[i])
+            self.k_buf[idx].copy_(k_cpu[i])
+            self.v_buf[idx].copy_(v_cpu[i])
             self.filled[idx] = True
 
     def update(
@@ -223,19 +226,17 @@ class PrefillMassAccumulator:
             scale = q.shape[-1] ** -0.5
         if len(k_positions) > self.prompt_len:
             raise ValueError("k_positions exceed prompt_len")
-        # Mass starts on CPU; move with the first GPU chunk (KVarN/FA live path).
-        if self.mass.device != q.device:
-            self.mass = self.mass.to(device=q.device)
         if v is not None:
             self.buffer_kv(k, v, k_positions)
-            # Score chunk Q against all keys buffered so far.
+            # Score chunk Q against all keys buffered so far (both on CPU).
             filled_idx = self.filled.nonzero(as_tuple=False).flatten().tolist()
             if not filled_idx:
                 return
             assert self.k_buf is not None
+            q_cpu = q.detach().to("cpu")
             k_all = self.k_buf[filled_idx]
             chunk_mass = accumulate_attention_mass_chunked(
-                q,
+                q_cpu,
                 k_all,
                 scale=scale,
                 tile_q=tile_q,
@@ -244,12 +245,14 @@ class PrefillMassAccumulator:
                 k_positions=filled_idx,
             )
             for i, pos in enumerate(filled_idx):
-                self.mass[pos] += chunk_mass[i]
+                self.mass[pos] += chunk_mass[i].to(self.mass.device)
             return
 
+        q_cpu = q.detach().to(self.mass.device)
+        k_cpu = k.detach().to(self.mass.device)
         chunk_mass = accumulate_attention_mass_chunked(
-            q,
-            k,
+            q_cpu,
+            k_cpu,
             scale=scale,
             tile_q=tile_q,
             tile_k=tile_k,

@@ -116,6 +116,10 @@ def run_h2o_after_attention(
         if out is None:
             continue
         state, k_out, v_out, pos_out = out
+        # PrefillMassAccumulator keeps K/V on CPU (3090 headroom); pages are GPU.
+        if k_out.device != query.device:
+            k_out = k_out.to(device=query.device)
+            v_out = v_out.to(device=query.device)
         keep_n = num_keep_tokens(req.prompt_len, float(envs.VLLM_H2O_RATIO))
         need_blocks = (keep_n + block_size - 1) // block_size if keep_n else 0
         block_ids = list(mass_acc.block_ids[:need_blocks])
