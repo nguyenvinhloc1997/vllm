@@ -12,6 +12,19 @@ from vllm.v1.h2o.rewrite import slot_to_block_offset
 from vllm.v1.h2o.slots import SlotLayout
 
 
+def is_fa_paged_kv_cache(kv_cache: torch.Tensor) -> bool:
+    """True for FlashAttention paged layout ``[num_blocks, H_kv, block_size, 2*D]``.
+
+    KVarN packed tiles are typically ``[num_blocks, H_kv, tile_bytes]`` (3-D).
+    """
+    return (
+        isinstance(kv_cache, torch.Tensor)
+        and kv_cache.ndim == 4
+        and kv_cache.shape[-1] >= 2
+        and kv_cache.shape[-1] % 2 == 0
+    )
+
+
 def split_fa_kv_cache(
     kv_cache: torch.Tensor, head_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:

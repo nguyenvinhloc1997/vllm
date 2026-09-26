@@ -240,7 +240,11 @@ def h2o_decode_after_commit(
         apply_committed_decode_step,
         apply_committed_decode_step_with_cache,
     )
-    from vllm.v1.h2o.pages import head_size_from_fa_kv_cache, split_fa_kv_cache
+    from vllm.v1.h2o.pages import (
+        head_size_from_fa_kv_cache,
+        is_fa_paged_kv_cache,
+        split_fa_kv_cache,
+    )
     from vllm.v1.h2o.runtime import get_h2o_runtime
 
     for req_id, positions in commits.items():
@@ -250,8 +254,12 @@ def h2o_decode_after_commit(
         for layer_name, layer_rt in rt.layers.items():
             attn = forward_ctx.get(layer_name)
             kv = getattr(attn, "kv_cache", None) if attn is not None else None
-            use_cache = isinstance(kv, torch.Tensor) and kv.numel() > 0
-            if use_cache:
+            use_fa_cache = (
+                isinstance(kv, torch.Tensor)
+                and kv.numel() > 0
+                and is_fa_paged_kv_cache(kv)
+            )
+            if use_fa_cache:
                 head_size = head_size_from_fa_kv_cache(kv)
                 key_cache, value_cache = split_fa_kv_cache(kv, head_size)
                 for pos in positions:
@@ -262,6 +270,7 @@ def h2o_decode_after_commit(
                         value_cache=value_cache,
                     )
             else:
+                # Policy-only: KVarN (and other non-FA) layouts skip FA rewrite.
                 for pos in positions:
                     apply_committed_decode_step(
                         layer_rt,
