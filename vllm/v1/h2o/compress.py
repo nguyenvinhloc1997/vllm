@@ -223,6 +223,9 @@ class PrefillMassAccumulator:
             scale = q.shape[-1] ** -0.5
         if len(k_positions) > self.prompt_len:
             raise ValueError("k_positions exceed prompt_len")
+        # Mass starts on CPU; move with the first GPU chunk (KVarN/FA live path).
+        if self.mass.device != q.device:
+            self.mass = self.mass.to(device=q.device)
         if v is not None:
             self.buffer_kv(k, v, k_positions)
             # Score chunk Q against all keys buffered so far.

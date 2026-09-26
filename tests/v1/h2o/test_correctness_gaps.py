@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from vllm.v1.h2o.compress import PrefillMassAccumulator, compress_prefill_kv
@@ -149,6 +150,30 @@ def test_multi_chunk_mass_accumulate_then_final_compress():
     assert state.k == 4
     assert k_out.shape[0] == 8
     assert set(kept_pos) == set(state.heavy) | set(state.recent)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_prefill_mass_moves_to_q_device():
+    """Live KVarN/FA path: mass starts CPU; first GPU update must not raise."""
+    torch.manual_seed(0)
+    prompt_len, h_kv, h_q, d = 8, 1, 2, 4
+    device = torch.device("cuda")
+    q = torch.randn(prompt_len, h_q, d, device=device)
+    k = torch.randn(prompt_len, h_kv, d, device=device)
+    v = torch.randn(prompt_len, h_kv, d, device=device)
+    acc = PrefillMassAccumulator(prompt_len=prompt_len)
+    assert acc.mass.device.type == "cpu"
+    acc.update(
+        q,
+        k,
+        q_positions=list(range(prompt_len)),
+        k_positions=list(range(prompt_len)),
+        v=v,
+        tile_q=4,
+        tile_k=4,
+    )
+    assert acc.mass.device.type == "cuda"
+    assert float(acc.mass.sum().item()) > 0
 
 
 def test_single_chunk_path_still_compresses_without_accumulator():
