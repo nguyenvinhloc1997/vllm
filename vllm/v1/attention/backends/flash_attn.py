@@ -1252,6 +1252,19 @@ class FlashAttentionImpl(AttentionImpl):
             layer._v_scale,
         )
 
+        # H2O hook (b): after full-attention KV write. Prefill compress runs
+        # when the runner later supplies end-of-prefill Q + absolute positions
+        # via after_full_attention_kv_update; Ownership-A block resize is
+        # deferred. Flag-off path is a single env check.
+        if envs.VLLM_H2O and self.sliding_window[0] < 0 and self.sliding_window[1] < 0:
+            from vllm.v1.h2o.compress import after_full_attention_kv_update
+
+            after_full_attention_kv_update(
+                key=key,
+                value=value,
+                sliding_window=self.sliding_window,
+            )
+
     def _forward_with_dcp(
         self,
         query: torch.Tensor,

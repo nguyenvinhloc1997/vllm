@@ -612,6 +612,11 @@ def generate_block_hash_extra_keys(
         lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
     )
 
+    # H2O-keyed prefix pages must not collide with full-KV (flag-off) hashes.
+    if envs.VLLM_H2O:
+        extra_keys.append("h2o")
+        extra_keys.append(envs.VLLM_H2O_RATIO)
+
     if not extra_keys:
         return None, new_start_mm_idx
 
