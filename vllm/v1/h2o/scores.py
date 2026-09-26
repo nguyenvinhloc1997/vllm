@@ -16,7 +16,7 @@ def accumulate_attention_mass(
     assert d == d_k and h_q % h_kv == 0
     group = h_q // h_kv
     # expand k to query heads
-    k_exp = k.unsqueeze(1).expand(t_k, group, h_kv, d).reshape(t_k, h_q, d)
+    k_exp = k.repeat_interleave(group, dim=1)
     # scores [T_q, H_q, T_k]
     logits = torch.einsum("qhd,khd->qhk", q * scale, k_exp)
     if t_q == t_k:

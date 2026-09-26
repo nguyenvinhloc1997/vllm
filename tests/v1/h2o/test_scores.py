@@ -20,3 +20,30 @@ def test_decode_query_mass_prefers_aligned_key():
     assert mass.shape == (2,)
     assert mass[0] > mass[1]
     assert mass_dict(mass, [10, 11])[10] == pytest.approx(mass[0].item())
+
+
+def test_gqa_query_head_one_uses_kv_head_zero():
+    # H_q=4, H_kv=2 → group=2. Query head 1 is the second member of KV head 0.
+    d = 4
+    q = torch.zeros(1, 4, d)
+    k = torch.zeros(2, 2, d)
+    q[0, 1, 0] = 1.0
+    k[0, 0, 0] = 1.0
+    k[1, 1, 1] = 1.0
+    mass = accumulate_attention_mass(q, k, scale=d**-0.5)
+    assert mass.shape == (2,)
+    assert mass[0] > mass[1]
+
+
+def test_gqa_prefill_causal_respects_kv_head_order():
+    d = 4
+    t = 2
+    q = torch.zeros(t, 4, d)
+    k = torch.zeros(t, 2, d)
+    q[0, 1, 0] = 1.0
+    q[1, 1, 0] = 1.0
+    k[0, 0, 0] = 1.0
+    k[1, 1, 1] = 1.0
+    mass = accumulate_attention_mass(q, k, scale=d**-0.5)
+    assert mass.shape == (t,)
+    assert mass[0] > mass[1]
