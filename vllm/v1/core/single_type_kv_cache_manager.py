@@ -108,6 +108,8 @@ class SingleTypeKVCacheManager(ABC):
         # Ownership-A H2O: after prefill compress, FA groups hold a fixed
         # ``num_keep`` token budget; allocate must not re-grow the table.
         self.h2o_num_tokens: dict[str, int] = {}
+        # Fresh retained blocks allocated before pack; swapped in after pack.
+        self.h2o_pending_blocks: dict[str, list[KVCacheBlock]] = {}
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
@@ -533,6 +535,10 @@ class SingleTypeKVCacheManager(ABC):
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
         self.h2o_num_tokens.pop(request_id, None)
+        pending = self.h2o_pending_blocks.pop(request_id, None)
+        if pending:
+            # Pending retained alloc never attached; free with the rest.
+            req_blocks = list(req_blocks) + list(pending)
         return req_blocks
 
     def free(self, request_id: str) -> None:
@@ -702,16 +708,70 @@ class SingleTypeKVCacheManager(ABC):
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
 
-    def resize_after_h2o_compress(self, request_id: str, num_keep_tokens: int) -> int:
-        """Ownership-A: truncate FA block table to ``ceil(num_keep / block_size)``.
+    def allocate_h2o_retained(self, request_id: str, num_keep_tokens: int) -> list[int]:
+        """Pre-allocate fresh blocks for H2O pack; do not attach to the table yet.
 
-        Frees unused trailing blocks back to the pool. Idempotent. Subsequent
-        ``allocate_new_blocks`` / ``get_num_blocks_to_allocate`` return no new
-        blocks for this request (fixed 2K budget; decode overwrites in place).
-
-        Returns:
-            Number of blocks retained.
+        Returns physical block ids. Idempotent if pending already exists.
         """
+        if request_id not in self.req_to_blocks:
+            return []
+        if num_keep_tokens < 0:
+            raise ValueError("num_keep_tokens must be non-negative")
+        if request_id in self.h2o_pending_blocks:
+            return [b.block_id for b in self.h2o_pending_blocks[request_id]]
+        n = cdiv(num_keep_tokens, self.block_size) if num_keep_tokens else 0
+        if n == 0:
+            self.h2o_pending_blocks[request_id] = []
+            return []
+        new_blocks = self.block_pool.get_new_blocks(n)
+        self.h2o_pending_blocks[request_id] = new_blocks
+        if self._record_new_block_ids:
+            self.new_block_ids.extend(b.block_id for b in new_blocks)
+        return [b.block_id for b in new_blocks]
+
+    def abort_h2o_retained(self, request_id: str) -> None:
+        """Free pre-allocated retained blocks when pack did not complete."""
+        pending = self.h2o_pending_blocks.pop(request_id, None)
+        if pending:
+            self.block_pool.free_blocks(reversed(pending))
+
+    def swap_after_h2o_compress(self, request_id: str, num_keep_tokens: int) -> int:
+        """Replace the FA block table with pre-allocated retained blocks.
+
+        Frees the old full-prompt blocks. Sets ``h2o_num_tokens`` so later
+        allocate does not re-grow. Idempotent if already compressed.
+        """
+        if request_id not in self.req_to_blocks:
+            return 0
+        if num_keep_tokens < 0:
+            raise ValueError("num_keep_tokens must be non-negative")
+        if request_id in self.h2o_num_tokens:
+            return len(self.req_to_blocks[request_id])
+
+        pending = self.h2o_pending_blocks.pop(request_id, None)
+        if pending is None:
+            raise RuntimeError(
+                f"H2O swap without pending retained blocks for {request_id}"
+            )
+        old = self.req_to_blocks[request_id]
+        self.req_to_blocks[request_id] = list(pending)
+        if old:
+            self.block_pool.free_blocks(reversed(old))
+        if request_id in self.num_cached_block:
+            self.num_cached_block[request_id] = min(
+                self.num_cached_block[request_id], len(pending)
+            )
+        self.h2o_num_tokens[request_id] = num_keep_tokens
+        return len(pending)
+
+    def resize_after_h2o_compress(self, request_id: str, num_keep_tokens: int) -> int:
+        """Deprecated FA densify path — delegates to swap when pending exists.
+
+        Kept for one transition; prefer ``swap_after_h2o_compress``.
+        """
+        if request_id in self.h2o_pending_blocks:
+            return self.swap_after_h2o_compress(request_id, num_keep_tokens)
+        # Legacy truncate (should not run on KVarN-native path).
         if request_id not in self.req_to_blocks:
             return 0
         if num_keep_tokens < 0:
@@ -721,14 +781,11 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         )
         blocks = self.req_to_blocks[request_id]
         if request_id in self.h2o_num_tokens:
-            # Already compressed; ensure length matches.
             return len(blocks)
 
         if len(blocks) > num_keep_blocks:
             freed = blocks[num_keep_blocks:]
             del blocks[num_keep_blocks:]
-            # Free tail first so newly-evictable blocks hit the free queue order
-            # consistent with remove_skipped / free().
             self.block_pool.free_blocks(reversed(freed))
 
         if request_id in self.num_cached_block:

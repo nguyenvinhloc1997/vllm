@@ -395,17 +395,48 @@ class KVCacheCoordinator(ABC):
             )
 
     def resize_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
-        """Ownership-A: resize each full-attention group; skip GDN/Mamba/SWA."""
+        """Swap (or legacy resize) each full-attention group; skip GDN/Mamba/SWA."""
         from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
         from vllm.v1.kv_cache_interface import FullAttentionSpec
 
         for manager in self.single_type_managers:
             if not isinstance(manager, FullAttentionManager):
                 continue
-            # Exact FullAttentionSpec only (not chunked-local / MLA / sink).
             if type(manager.kv_cache_spec) is not FullAttentionSpec:
                 continue
-            manager.resize_after_h2o_compress(request_id, num_keep_tokens)
+            manager.swap_after_h2o_compress(request_id, num_keep_tokens)
+
+    def allocate_h2o_retained(self, request_id: str, num_keep_tokens: int) -> list[int]:
+        """Pre-allocate retained FA blocks for H2O pack; return physical ids."""
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        ids: list[int] | None = None
+        for manager in self.single_type_managers:
+            if not isinstance(manager, FullAttentionManager):
+                continue
+            if type(manager.kv_cache_spec) is not FullAttentionSpec:
+                continue
+            got = manager.allocate_h2o_retained(request_id, num_keep_tokens)
+            if ids is None:
+                ids = got
+            elif got != ids:
+                raise RuntimeError("H2O retained block ids differ across FA managers")
+        return ids or []
+
+    def abort_h2o_retained(self, request_id: str) -> None:
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        for manager in self.single_type_managers:
+            if not isinstance(manager, FullAttentionManager):
+                continue
+            if type(manager.kv_cache_spec) is not FullAttentionSpec:
+                continue
+            manager.abort_h2o_retained(request_id)
+
+    def swap_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
+        self.resize_h2o_full_attention(request_id, num_keep_tokens)
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """

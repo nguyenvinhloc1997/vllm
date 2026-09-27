@@ -296,10 +296,12 @@ class SchedulerOutput:
     num_spec_tokens_to_schedule: int = 0
 
     # Request IDs whose scheduled tokens first reached prompt_len this step.
-    # Ownership-A resize must only run when update_from_output processes
+    # Ownership swap must only run when update_from_output processes
     # *this* SchedulerOutput (async scheduling can deliver earlier steps'
     # outputs after the flag is set on the request).
     h2o_resize_req_ids: list[str] = field(default_factory=list)
+    # Pre-allocated retained FA physical block ids for those requests.
+    h2o_new_block_ids: dict[str, list[int]] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

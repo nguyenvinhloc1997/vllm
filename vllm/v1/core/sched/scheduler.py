@@ -1479,7 +1479,18 @@ class Scheduler(SchedulerInterface):
             )
             request.h2o_pending_resize = crossed_prompt
             if crossed_prompt:
+                from vllm.v1.h2o.ownership import num_keep_tokens
+
+                keep_n = num_keep_tokens(
+                    request.num_prompt_tokens, float(envs.VLLM_H2O_RATIO)
+                )
+                new_ids = self.kv_cache_manager.allocate_h2o_retained(req_id, keep_n)
                 scheduler_output.h2o_resize_req_ids.append(req_id)
+                scheduler_output.h2o_new_block_ids[req_id] = new_ids
+                if new_ids:
+                    if scheduler_output.new_block_ids_to_zero is None:
+                        scheduler_output.new_block_ids_to_zero = []
+                    scheduler_output.new_block_ids_to_zero.extend(new_ids)
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
@@ -2000,22 +2011,23 @@ class Scheduler(SchedulerInterface):
                         request.num_prompt_tokens, float(envs.VLLM_H2O_RATIO)
                     )
                     logger.info(
-                        "[H2O_DIAG] resize_begin req=%s prompt=%d num_keep=%d",
+                        "[H2O_DIAG] swap_begin req=%s prompt=%d num_keep=%d",
                         req_id,
                         request.num_prompt_tokens,
                         keep_n,
                     )
-                    self.kv_cache_manager.resize_h2o_full_attention(
+                    self.kv_cache_manager.swap_h2o_full_attention(
                         req_id,
                         keep_n,
                     )
-                    logger.info("[H2O_DIAG] resize_done req=%s", req_id)
+                    logger.info("[H2O_DIAG] swap_done req=%s", req_id)
                 else:
                     logger.info(
-                        "[H2O_DIAG] resize_skip_no_pack req=%s packed=%s",
+                        "[H2O_DIAG] swap_skip_no_pack req=%s packed=%s",
                         req_id,
                         sorted(model_runner_output.h2o_packed_request_ids),
                     )
+                    self.kv_cache_manager.abort_h2o_retained(req_id)
                 request.h2o_pending_resize = False
 
             # Free encoder inputs only after the step has actually executed.

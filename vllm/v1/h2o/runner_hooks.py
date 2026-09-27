@@ -26,8 +26,9 @@ def maybe_set_h2o_batch_context(
     num_scheduled_tokens: Sequence[int] | np.ndarray,
     query_start_loc_np: np.ndarray,
     positions: torch.Tensor,
+    h2o_new_block_ids: Mapping[str, Sequence[int]] | None = None,
 ) -> None:
-    """Publish end-of-prefill gates for H2O FA compress (flag-gated)."""
+    """Publish end-of-prefill gates for H2O compress (flag-gated)."""
     if not envs.VLLM_H2O:
         return
     from vllm.v1.h2o.context import (
@@ -39,6 +40,7 @@ def maybe_set_h2o_batch_context(
 
     clear_h2o_batch_context()
     num_reqs = len(req_ids)
+    new_ids_map = h2o_new_block_ids or {}
     req_ctxs: list[H2ORequestContext] = []
     for i, req_id in enumerate(req_ids[:num_reqs]):
         num_computed = int(num_computed_tokens[i])
@@ -47,6 +49,7 @@ def maybe_set_h2o_batch_context(
         is_last = num_computed < prompt_len and num_computed + n_sched >= prompt_len
         token_start = int(query_start_loc_np[i])
         token_end = int(query_start_loc_np[i + 1])
+        nb = new_ids_map.get(req_id)
         req_ctxs.append(
             H2ORequestContext(
                 request_id=req_id,
@@ -55,6 +58,7 @@ def maybe_set_h2o_batch_context(
                 is_last_prefill_chunk=is_last,
                 token_start=token_start,
                 token_end=token_end,
+                new_block_ids=list(nb) if nb is not None else None,
             )
         )
     pos_t = positions[0] if positions.ndim > 1 else positions

@@ -61,12 +61,18 @@ def test_h2o_resize_requires_completed_pack(
     scheduler = create_scheduler()
     (request,) = create_requests(num_requests=1, num_tokens=600)
     scheduler.add_request(request)
-    resize = Mock()
-    monkeypatch.setattr(scheduler.kv_cache_manager, "resize_h2o_full_attention", resize)
+    swap = Mock()
+    abort = Mock()
+    alloc = Mock(return_value=[7, 8])
+    monkeypatch.setattr(scheduler.kv_cache_manager, "swap_h2o_full_attention", swap)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "abort_h2o_retained", abort)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_h2o_retained", alloc)
 
     scheduler_output = scheduler.schedule()
     assert request.h2o_pending_resize
     assert request.request_id in scheduler_output.h2o_resize_req_ids
+    assert scheduler_output.h2o_new_block_ids.get(request.request_id) == [7, 8]
+    assert alloc.call_count == 1
     model_output = ModelRunnerOutput(
         req_ids=[request.request_id],
         req_id_to_index={request.request_id: 0},
@@ -76,7 +82,8 @@ def test_h2o_resize_requires_completed_pack(
 
     scheduler.update_from_output(scheduler_output, model_output)
 
-    assert resize.call_count == int(packed)
+    assert swap.call_count == int(packed)
+    assert abort.call_count == int(not packed)
     assert not request.h2o_pending_resize
 
 
@@ -86,14 +93,18 @@ def test_h2o_resize_ignores_earlier_inflight_step(monkeypatch: pytest.MonkeyPatc
     Under async scheduling, schedule(last-prefill) sets h2o_pending_resize
     before update_from_output of a prior chunk runs. That prior output has
     empty h2o_packed_request_ids; clearing pending there permanently skips
-    Ownership-A resize when the pack step's output finally arrives.
+    Ownership swap when the pack step's output finally arrives.
     """
     monkeypatch.setattr(envs, "VLLM_H2O", True)
     scheduler = create_scheduler(max_num_batched_tokens=256)
     (request,) = create_requests(num_requests=1, num_tokens=600)
     scheduler.add_request(request)
-    resize = Mock()
-    monkeypatch.setattr(scheduler.kv_cache_manager, "resize_h2o_full_attention", resize)
+    swap = Mock()
+    abort = Mock()
+    alloc = Mock(return_value=[1, 2])
+    monkeypatch.setattr(scheduler.kv_cache_manager, "swap_h2o_full_attention", swap)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "abort_h2o_retained", abort)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_h2o_retained", alloc)
 
     earlier = scheduler.schedule()
     assert request.request_id not in earlier.h2o_resize_req_ids
@@ -117,7 +128,7 @@ def test_h2o_resize_ignores_earlier_inflight_step(monkeypatch: pytest.MonkeyPatc
     )
     scheduler.update_from_output(earlier, earlier_out)
     assert request.h2o_pending_resize
-    assert resize.call_count == 0
+    assert swap.call_count == 0
 
     pack_out = ModelRunnerOutput(
         req_ids=[request.request_id],
@@ -126,7 +137,7 @@ def test_h2o_resize_ignores_earlier_inflight_step(monkeypatch: pytest.MonkeyPatc
         h2o_packed_request_ids=[request.request_id],
     )
     scheduler.update_from_output(crossing, pack_out)
-    assert resize.call_count == 1
+    assert swap.call_count == 1
     assert not request.h2o_pending_resize
 
 

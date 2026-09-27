@@ -4177,8 +4177,9 @@ class GPUModelRunner(
         num_reqs: int,
         positions: torch.Tensor,
         num_scheduled_tokens_np: np.ndarray,
+        h2o_new_block_ids: dict[str, list[int]] | None = None,
     ) -> None:
-        """Publish end-of-prefill gates for H2O FA compress (flag-gated)."""
+        """Publish end-of-prefill gates for H2O compress (flag-gated)."""
         from vllm.v1.h2o.runner_hooks import maybe_set_h2o_batch_context
 
         maybe_set_h2o_batch_context(
@@ -4188,6 +4189,7 @@ class GPUModelRunner(
             num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs],
             query_start_loc_np=self.query_start_loc.np[: num_reqs + 1],
             positions=positions,
+            h2o_new_block_ids=h2o_new_block_ids,
         )
 
     def _maybe_remap_h2o_decode_slots(
@@ -4600,6 +4602,7 @@ class GPUModelRunner(
             num_reqs=num_reqs,
             positions=positions,
             num_scheduled_tokens_np=num_scheduled_tokens_np,
+            h2o_new_block_ids=getattr(scheduler_output, "h2o_new_block_ids", None),
         )
         try:
             with (

@@ -593,8 +593,17 @@ class KVCacheManager:
         )
 
     def resize_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
-        """Ownership-A: shrink full-attention groups to ``ceil(2K/block_size)``."""
+        """Swap FA block tables to H2O retained blocks after pack."""
         self.coordinator.resize_h2o_full_attention(request_id, num_keep_tokens)
+
+    def allocate_h2o_retained(self, request_id: str, num_keep_tokens: int) -> list[int]:
+        return self.coordinator.allocate_h2o_retained(request_id, num_keep_tokens)
+
+    def abort_h2o_retained(self, request_id: str) -> None:
+        self.coordinator.abort_h2o_retained(request_id)
+
+    def swap_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
+        self.coordinator.swap_h2o_full_attention(request_id, num_keep_tokens)
 
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping and return its blocks without

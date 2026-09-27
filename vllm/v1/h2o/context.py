@@ -22,6 +22,8 @@ class H2ORequestContext:
     # Token slice into the batch Q/K/V / positions tensors.
     token_start: int
     token_end: int
+    # Pre-allocated retained FA block ids for KVarN-native pack (optional).
+    new_block_ids: list[int] | None = None
 
 
 @dataclass

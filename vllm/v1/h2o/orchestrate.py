@@ -160,22 +160,22 @@ def run_h2o_after_attention(
         v_out = v_full[pos_out]
 
         need_blocks = (len(pos_out) + block_size - 1) // block_size
-        block_ids = list(stash.block_ids[:need_blocks])
+        # KVarN-native: pack into pre-allocated retained blocks from the
+        # scheduler (fresh short table). Fail closed if missing/short.
+        block_ids = list(req.new_block_ids or [])
         if len(block_ids) < need_blocks:
-            seen = set(block_ids)
-            for s in slots.tolist():
-                if s < 0:
-                    continue
-                bid = int(s) // block_size
-                if bid not in seen:
-                    seen.add(bid)
-                    block_ids.append(bid)
-                if len(block_ids) >= need_blocks:
-                    break
-        block_ids = block_ids[:need_blocks]
-        if not block_ids:
             ctx.failed_pack_request_ids.add(req.request_id)
+            drop_prefill_q(req.request_id, layer_name=layer_name)
+            logger.info(
+                "[H2O_DIAG] pack_skip missing_new_blocks req=%s layer=%s "
+                "need=%d have=%d",
+                req.request_id,
+                layer_name,
+                need_blocks,
+                len(block_ids),
+            )
             continue
+        block_ids = block_ids[:need_blocks]
         writer.write_kept_kv(k_out, v_out, block_ids=block_ids, block_size=block_size)
         layout = build_slot_layout(pos_out, block_ids, block_size)
         set_h2o_layer_runtime(
