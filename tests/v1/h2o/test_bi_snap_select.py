@@ -57,3 +57,37 @@ def test_bi_snap_short_prompt_keeps_all():
     # keep = 4, but w=256 forces R=min(10,256)=10 → keep all in recent
     assert state.heavy == []
     assert state.recent == list(range(prompt_len))
+
+
+def test_bi_snap_m_zero_decode_rotates_recent():
+    """When keep <= R, bi-window sets ``k=M=0``; decode must still rotate."""
+    from vllm.v1.h2o.policy import decode_step
+    from vllm.v1.h2o.slots import (
+        build_slot_layout,
+        plan_decode_slot_writes,
+        remap_decode_write_slot,
+    )
+
+    prompt_len = 512
+    mass = {i: float(i % 17) for i in range(prompt_len)}
+    state = select_bi_snap(mass, prompt_len, ratio=0.4)
+    assert state.k == 0
+    assert state.heavy == []
+    assert len(state.recent) == 256
+    assert state.update_heavy is False
+
+    positions = list(state.recent)
+    layout = build_slot_layout(
+        positions, block_ids=list(range((len(positions) + 127) // 128)), block_size=128
+    )
+    assert layout.num_keep == 256
+    slot = remap_decode_write_slot(state, layout)
+    assert slot == layout.slot_for_pos(state.recent[0])
+
+    plan = plan_decode_slot_writes(state, layout, prompt_len, {})
+    assert plan.state_after.recent[-1] == prompt_len
+    assert len(plan.state_after.recent) == 256
+    assert plan.state_after.heavy == []
+
+    after = decode_step(state, prompt_len, {})
+    assert after.recent == [*state.recent[1:], prompt_len]

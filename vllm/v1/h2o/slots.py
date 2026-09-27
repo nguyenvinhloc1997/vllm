@@ -102,12 +102,10 @@ def plan_decode_slot_writes(
     Algorithm-1 may promote that token into heavy; bi-window state keeps heavy
     frozen and simply rotates its larger recent window.
     """
-    if state.k <= 0:
+    retained = set(state.heavy) | set(state.recent)
+    if layout.num_keep <= 0 or not retained:
         raise ValueError("empty H2O budget")
-    at_capacity = (
-        len(set(state.heavy) | set(state.recent)) == layout.num_keep
-        and len(state.heavy) == state.k
-    )
+    at_capacity = len(retained) == layout.num_keep and len(state.heavy) == state.k
     state_after = decode_step(state, new_pos, new_scores_delta)
 
     if not at_capacity:
@@ -213,11 +211,16 @@ def remap_decode_write_slot(
     into the compressed 2K table instead of an absolute-position OOB slot.
     Does not mutate state; eviction bookkeeping runs after commit.
     """
-    if state.k <= 0:
+    retained = set(state.heavy) | set(state.recent)
+    if layout.num_keep <= 0 or not retained:
         raise ValueError("empty H2O budget")
-    if len(state.recent) < state.k:
-        local = len(set(state.heavy) | set(state.recent))
+    # Classic Alg-1 fills recent until ``k``; bi-window ``k=M`` may be 0 with
+    # a full recent window already packed at prefill.
+    if state.update_heavy and len(state.recent) < state.k:
+        local = len(retained)
         if local < layout.num_keep:
             return layout.slot_for_local(local)
         return layout.slot_for_local(max(layout.num_keep - 1, 0))
+    if not state.recent:
+        raise ValueError("empty H2O budget")
     return layout.slot_for_pos(state.recent[0])

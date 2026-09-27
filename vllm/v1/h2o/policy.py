@@ -54,9 +54,12 @@ def select_prefill(scores: dict[int, float], prompt_len: int, k: int) -> H2OStat
 def decode_step(
     state: H2OState, new_pos: int, new_scores_delta: dict[int, float]
 ) -> H2OState:
-    if state.k <= 0:
-        return state
+    # Bi-window freezes heavy and sets ``k = M`` (middle budget). ``M`` may be
+    # 0 while ``recent`` is still non-empty; rotate recent before the classic
+    # ``k <= 0`` empty-budget bail-out.
     if not state.update_heavy:
+        if not state.recent:
+            return state
         recent = [*state.recent[1:], new_pos]
         keep = set(state.heavy) | set(recent)
         scores = {p: state.scores.get(p, 0.0) for p in keep}
@@ -67,6 +70,8 @@ def decode_step(
             scores=scores,
             update_heavy=False,
         )
+    if state.k <= 0:
+        return state
     scores = dict(state.scores)
     for p, d in new_scores_delta.items():
         if p in scores or p == new_pos:
