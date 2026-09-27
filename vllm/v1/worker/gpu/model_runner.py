@@ -1080,8 +1080,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None:
+                # H2O Ownership-A: replace with the short retained snapshot.
+                overwrite = req_id in reqs.h2o_replaced_req_ids
                 self.block_tables.append_block_ids(
-                    req_index, req_new_block_ids, overwrite=False
+                    req_index, req_new_block_ids, overwrite=overwrite
                 )
 
         # Update CPU num_computed_prefill_tokens.

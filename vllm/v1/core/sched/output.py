@@ -144,6 +144,11 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # After H2O Ownership-A swap the scheduler holds the short retained table,
+    # but allocate_slots no longer emits those ids as "new" blocks. The worker
+    # must replace (not append) its cached FA block table with this full
+    # snapshot or attention keeps reading the pre-pack long table.
+    h2o_replaced_req_ids: set[str] = field(default_factory=set)
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -155,6 +160,7 @@ class CachedRequestData:
             f"CachedRequestData("
             f"req_ids={self.req_ids},"
             f"resumed_req_ids={self.resumed_req_ids},"
+            f"h2o_replaced_req_ids={self.h2o_replaced_req_ids},"
             f"new_token_ids_lens={new_token_ids_lens},"
             f"all_token_ids_lens={all_token_ids_lens},"
             f"new_block_ids={self.new_block_ids},"
@@ -194,6 +200,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            h2o_replaced_req_ids=set(),
         )
 
 

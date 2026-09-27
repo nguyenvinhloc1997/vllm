@@ -141,6 +141,51 @@ def test_h2o_resize_ignores_earlier_inflight_step(monkeypatch: pytest.MonkeyPatc
     assert not request.h2o_pending_resize
 
 
+def test_h2o_swap_forces_worker_block_table_replace(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """After Ownership-A swap, next CachedRequestData must replace (not append).
+
+    allocate_slots no longer emits the retained pages as "new" blocks, so without
+    an explicit replace the worker keeps the pre-pack long FA table while
+    seq_len clamp + circular remap assume the short packed layout.
+    """
+    monkeypatch.setattr(envs, "VLLM_H2O", True)
+    scheduler = create_scheduler()
+    (request,) = create_requests(num_requests=1, num_tokens=600)
+    scheduler.add_request(request)
+    short_blocks = ([101, 102],)
+    swap = Mock()
+    abort = Mock()
+    alloc = Mock(return_value=[7, 8])
+    monkeypatch.setattr(scheduler.kv_cache_manager, "swap_h2o_full_attention", swap)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "abort_h2o_retained", abort)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_h2o_retained", alloc)
+    monkeypatch.setattr(
+        scheduler.kv_cache_manager, "get_block_ids", Mock(return_value=short_blocks)
+    )
+
+    pack_step = scheduler.schedule()
+    assert request.request_id in pack_step.h2o_resize_req_ids
+    scheduler.update_from_output(
+        pack_step,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[1000]],
+            h2o_packed_request_ids=[request.request_id],
+        ),
+    )
+    assert swap.call_count == 1
+    assert request.request_id in scheduler.h2o_pending_worker_bt_replace
+
+    decode_step = scheduler.schedule()
+    cached = decode_step.scheduled_cached_reqs
+    assert request.request_id in cached.h2o_replaced_req_ids
+    assert cached.new_block_ids[0] == short_blocks
+    assert request.request_id not in scheduler.h2o_pending_worker_bt_replace
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [

@@ -116,6 +116,9 @@ class Scheduler(SchedulerInterface):
         )
         # Track requests scheduled in prior step (MRV1-only).
         self.prev_step_scheduled_req_ids: set[str] = set()
+        # After H2O Ownership-A swap, force the worker to replace its FA
+        # block table with the short retained snapshot on the next schedule.
+        self.h2o_pending_worker_bt_replace: set[str] = set()
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -1607,6 +1610,7 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
+        h2o_replaced_req_ids: set[str] = set()
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -1633,9 +1637,15 @@ class Scheduler(SchedulerInterface):
             if not self.use_v2_model_runner:  # noqa: SIM102
                 if req_id not in self.prev_step_scheduled_req_ids:
                     all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
+            if req_id in self.h2o_pending_worker_bt_replace:
+                # Full short retained table — worker must replace, not append.
+                new_block_ids.append(self.kv_cache_manager.get_block_ids(req_id))
+                h2o_replaced_req_ids.add(req_id)
+                self.h2o_pending_worker_bt_replace.discard(req_id)
+            else:
+                new_block_ids.append(
+                    req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+                )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1649,6 +1659,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            h2o_replaced_req_ids=h2o_replaced_req_ids,
         )
 
     def _try_schedule_encoder_inputs(
@@ -2049,6 +2060,7 @@ class Scheduler(SchedulerInterface):
                         req_id,
                         keep_n,
                     )
+                    self.h2o_pending_worker_bt_replace.add(req_id)
                     logger.info("[H2O_DIAG] swap_done req=%s", req_id)
                 else:
                     logger.info(
@@ -2660,6 +2672,7 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        self.h2o_pending_worker_bt_replace.discard(request.request_id)
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.

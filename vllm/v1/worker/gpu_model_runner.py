@@ -1371,6 +1371,7 @@ class GPUModelRunner(
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
+            h2o_replaced = req_id in req_data.h2o_replaced_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
@@ -1453,7 +1454,12 @@ class GPUModelRunner(
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
             # Update the block IDs.
-            if not resumed_from_preemption:
+            if h2o_replaced:
+                # Ownership-A swap: replace the cached FA table with the short
+                # retained snapshot (append would keep the pre-pack long table).
+                assert new_block_ids is not None
+                req_state.block_ids = new_block_ids
+            elif not resumed_from_preemption:
                 if new_block_ids is not None:
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
@@ -1484,7 +1490,11 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
-            if new_block_ids is not None:
+            if h2o_replaced:
+                assert new_block_ids is not None
+                self.input_batch.block_table.clear_row(req_index)
+                self.input_batch.block_table.add_row(new_block_ids, req_index)
+            elif new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 
             # For the last rank, we don't need to update the token_ids_cpu
