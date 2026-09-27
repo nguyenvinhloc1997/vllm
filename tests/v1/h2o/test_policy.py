@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # tests/v1/h2o/test_policy.py
+from dataclasses import fields
+
 import pytest
 
-from vllm.v1.h2o.policy import compute_k, decode_step, select_prefill
+from vllm.v1.h2o.policy import H2OState, compute_k, decode_step, select_prefill
 
 
 def test_compute_k_twenty_percent_even():
@@ -67,3 +69,17 @@ def test_decode_step_five_times_keeps_budget():
         assert state.recent[-1] == pos
         assert set(state.scores) == set(state.heavy) | set(state.recent)
         pos += 1
+
+
+def test_bi_window_decode_rotates_recent_without_updating_heavy():
+    assert "update_heavy" in {field.name for field in fields(H2OState)}
+    state = H2OState(
+        k=2,
+        heavy=[1, 3],
+        recent=[8, 9],
+        scores={1: 10.0, 3: 1.0, 8: 5.0, 9: 5.0},
+        update_heavy=False,
+    )
+    out = decode_step(state, new_pos=10, new_scores_delta={3: 1000.0, 8: 1000.0})
+    assert out.heavy == [1, 3]
+    assert out.recent == [9, 10]

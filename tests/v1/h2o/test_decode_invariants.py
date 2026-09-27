@@ -100,11 +100,11 @@ def test_decode_invariants_layer_runtime_matches_policy():
 @pytestmark_cpu
 def test_hybrid_prefill_compress_and_decode_leaves_mamba_blocks_unchanged(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_H2O", True)
-    monkeypatch.setattr(envs, "VLLM_H2O_RATIO", 0.2)
+    monkeypatch.setattr(envs, "VLLM_H2O_RATIO", 0.8)
 
     block_size = 16
-    prompt_len = 200
-    ratio = 0.2
+    prompt_len = 400
+    ratio = 0.8
     keep_blocks = num_keep_blocks(prompt_len, block_size, ratio)
     keep = num_keep_tokens(prompt_len, ratio)
 

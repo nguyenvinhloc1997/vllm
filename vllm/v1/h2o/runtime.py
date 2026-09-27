@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from vllm.v1.h2o.compress import PrefillMassAccumulator
+from vllm.v1.h2o.compress import PrefillQStash
 from vllm.v1.h2o.policy import H2OState
 from vllm.v1.h2o.slots import SlotLayout
 
@@ -35,8 +35,8 @@ class H2ORequestRuntime:
     layers: dict[str, H2OLayerRuntime] = field(default_factory=dict)
     # Absolute positions of decode tokens committed since last maintenance.
     pending_committed_positions: list[int] = field(default_factory=list)
-    # layer_name → chunked-prefill mass accumulator (cleared after compress).
-    prefill_mass: dict[str, PrefillMassAccumulator] = field(default_factory=dict)
+    # layer_name → front/tail query stash (cleared after compress).
+    prefill_q: dict[str, PrefillQStash] = field(default_factory=dict)
 
 
 _RUNTIME: dict[str, H2ORequestRuntime] = {}
@@ -66,19 +66,25 @@ def set_h2o_layer_runtime(
 ) -> H2ORequestRuntime:
     rt = get_or_create_h2o_request_runtime(request_id, prompt_len=prompt_len)
     rt.layers[layer_name] = H2OLayerRuntime(state=state, layout=layout)
-    rt.prefill_mass.pop(layer_name, None)
+    rt.prefill_q.pop(layer_name, None)
     return rt
 
 
-def get_or_create_prefill_mass(
+def get_or_create_prefill_q(
     request_id: str, *, layer_name: str, prompt_len: int
-) -> PrefillMassAccumulator:
+) -> PrefillQStash:
     rt = get_or_create_h2o_request_runtime(request_id, prompt_len=prompt_len)
-    acc = rt.prefill_mass.get(layer_name)
-    if acc is None or acc.prompt_len != prompt_len:
-        acc = PrefillMassAccumulator(prompt_len=prompt_len)
-        rt.prefill_mass[layer_name] = acc
-    return acc
+    stash = rt.prefill_q.get(layer_name)
+    if stash is None or stash.prompt_len != prompt_len:
+        stash = PrefillQStash(prompt_len=prompt_len)
+        rt.prefill_q[layer_name] = stash
+    return stash
+
+
+def drop_prefill_q(request_id: str, *, layer_name: str) -> None:
+    rt = _RUNTIME.get(request_id)
+    if rt is not None:
+        rt.prefill_q.pop(layer_name, None)
 
 
 def clear_h2o_runtime(request_id: str) -> None:

@@ -40,9 +40,9 @@ def test_compress_prefill_kv_gathers_selected_positions():
     v = torch.randn(t, h, d)
     positions = list(range(100, 108))  # absolute positions, not 0..t-1
     state, k_out, v_out, pos_out = compress_prefill_kv(q, k, v, positions, ratio=0.5)
-    assert state.k == 2
-    assert k_out.shape[0] == 4
-    assert v_out.shape[0] == 4
+    assert state.k == 0
+    assert k_out.shape[0] == t
+    assert v_out.shape[0] == t
     assert pos_out == sorted(pos_out)
     assert set(pos_out) == set(state.heavy) | set(state.recent)
 
@@ -133,9 +133,9 @@ def test_try_compress_prefill_kv_flag_gated(monkeypatch):
     )
     assert out is not None
     state, k_out, v_out, pos_out = out
-    assert state.k == 2
-    assert k_out.shape[0] == 4
-    assert v_out.shape[0] == 4
+    assert state.k == 0
+    assert k_out.shape[0] == t
+    assert v_out.shape[0] == t
     assert pos_out == sorted(pos_out)
 
 
@@ -197,13 +197,13 @@ def test_manager_end_of_prefill_ownership_a_once(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_H2O", True)
     monkeypatch.setattr(envs, "VLLM_H2O_RATIO", 0.5)
 
-    block_size = 4
-    prompt_len = 16
+    block_size = 16
+    prompt_len = 512
     ratio = 0.5
     keep = num_keep_tokens(prompt_len, ratio)
-    assert keep == 8
+    assert keep == 256
     keep_blocks = num_keep_blocks(prompt_len, block_size, ratio)
-    assert keep_blocks == 2
+    assert keep_blocks == 16
 
     fa_spec = FullAttentionSpec(
         block_size=block_size,
@@ -219,7 +219,7 @@ def test_manager_end_of_prefill_ownership_a_once(monkeypatch):
         num_speculative_blocks=0,
     )
     pool = BlockPool(
-        num_gpu_blocks=64, enable_caching=False, hash_block_size=block_size
+        num_gpu_blocks=128, enable_caching=False, hash_block_size=block_size
     )
     fa = FullAttentionManager(
         fa_spec,
@@ -384,6 +384,7 @@ def test_manager_flag_off_skips_resize(monkeypatch):
 
 
 def test_num_keep_tokens_matches_policy():
-    assert num_keep_tokens(1, 0.2) == 1  # compute_k→0 → keep all
-    assert num_keep_tokens(100, 0.2) == 20
-    assert math.ceil(20 / 16) == num_keep_blocks(100, 16, 0.2)
+    assert num_keep_tokens(1, 0.2) == 1
+    assert num_keep_tokens(100, 0.2) == 100  # W covers the short prompt
+    assert num_keep_tokens(1000, 0.4) == 400
+    assert math.ceil(400 / 16) == num_keep_blocks(1000, 16, 0.4)

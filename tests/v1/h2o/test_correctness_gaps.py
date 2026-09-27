@@ -6,10 +6,9 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
 
-from vllm.v1.h2o.compress import PrefillMassAccumulator, compress_prefill_kv
+from vllm.v1.h2o.compress import PrefillQStash, compress_prefill_kv
 from vllm.v1.h2o.decode import (
     apply_committed_decode_step_with_cache,
     score_committed_decode_delta,
@@ -102,78 +101,32 @@ def test_clamp_h2o_seq_len_helper():
     assert buf.tolist() == [100, 64, 200]
 
 
-def test_multi_chunk_mass_accumulate_then_final_compress():
-    """Chunked prefill: accumulate mass + KV, compress on last chunk (gap 4)."""
-    torch.manual_seed(0)
-    prompt_len, h_kv, h_q, d = 16, 2, 4, 8
-    q_full = torch.randn(prompt_len, h_q, d)
-    k_full = torch.randn(prompt_len, h_kv, d)
-    v_full = torch.randn(prompt_len, h_kv, d)
-    positions = list(range(prompt_len))
-
-    acc = PrefillMassAccumulator(prompt_len=prompt_len)
-    chunk = 4
-    for start in range(0, prompt_len, chunk):
-        end = start + chunk
-        acc.note_slots(
-            list(range(start, end)),  # pretend slot==local index, block_size=4
-            block_size=4,
-        )
-        acc.update(
-            q_full[start:end],
-            k_full[start:end],
-            q_positions=positions[start:end],
-            k_positions=positions[start:end],
-            v=v_full[start:end],
-            tile_q=4,
-            tile_k=4,
+def test_prefill_q_stash_keeps_fixed_front_and_rolling_tail():
+    prompt_len, h_q, d = 700, 2, 4
+    q = torch.arange(prompt_len * h_q * d, dtype=torch.float32).reshape(
+        prompt_len, h_q, d
+    )
+    stash = PrefillQStash(prompt_len=prompt_len)
+    for start in range(0, prompt_len, 100):
+        end = min(start + 100, prompt_len)
+        stash.observe(
+            q[start:end],
+            positions=list(range(start, end)),
+            slots=list(range(start, end)),
+            block_size=20,
         )
 
-    assert bool(acc.filled.all().item())
-    assert len(acc.block_ids) == 4  # 16 tokens / block_size 4
-    full = acc.full_kv()
-    assert full is not None
-    k_buf, v_buf, pos_out = full
-    assert pos_out == positions
-    assert torch.allclose(k_buf, k_full)
-    assert torch.allclose(v_buf, v_full)
-    assert acc.mass.sum() > 0
-
-    state, k_out, v_out, kept_pos = compress_prefill_kv(
-        q_full,
-        k_buf,
-        v_buf,
-        positions,
-        ratio=0.5,
-        mass=acc.mass,
-    )
-    assert state.k == 4
-    assert k_out.shape[0] == 8
-    assert set(kept_pos) == set(state.heavy) | set(state.recent)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_prefill_mass_stays_on_cpu_when_q_is_cuda():
-    """Live path must not park full-prompt K/V/mass on the 3090."""
-    torch.manual_seed(0)
-    prompt_len, h_kv, h_q, d = 8, 1, 2, 4
-    device = torch.device("cuda")
-    q = torch.randn(prompt_len, h_q, d, device=device)
-    k = torch.randn(prompt_len, h_kv, d, device=device)
-    v = torch.randn(prompt_len, h_kv, d, device=device)
-    acc = PrefillMassAccumulator(prompt_len=prompt_len)
-    acc.update(
-        q,
-        k,
-        q_positions=list(range(prompt_len)),
-        k_positions=list(range(prompt_len)),
-        v=v,
-        tile_q=4,
-        tile_k=4,
-    )
-    assert acc.mass.device.type == "cpu"
-    assert acc.k_buf is not None and acc.k_buf.device.type == "cpu"
-    assert float(acc.mass.sum().item()) > 0
+    assert stash.q_front is not None
+    assert stash.q_tail is not None
+    assert stash.q_front.shape == (256, h_q, d)
+    assert stash.q_tail.shape == (256, h_q, d)
+    assert not hasattr(stash, "k_buf")
+    assert not hasattr(stash, "v_buf")
+    q_obs, obs_positions = stash.observations()
+    assert obs_positions == list(range(256)) + list(range(444, 700))
+    assert torch.equal(q_obs, q[obs_positions])
+    assert stash.slots == list(range(prompt_len))
+    assert stash.block_ids == list(range(35))
 
 
 def test_single_chunk_path_still_compresses_without_accumulator():
@@ -185,7 +138,7 @@ def test_single_chunk_path_still_compresses_without_accumulator():
     state, k_out, v_out, pos_out = compress_prefill_kv(
         q, k, v, list(range(t)), ratio=0.5
     )
-    assert k_out.shape[0] == 4
+    assert k_out.shape[0] == t
     assert set(pos_out) == set(state.heavy) | set(state.recent)
 
 

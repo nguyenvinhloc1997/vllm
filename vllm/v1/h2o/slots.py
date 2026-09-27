@@ -98,15 +98,16 @@ def plan_decode_slot_writes(
 ) -> DecodeSlotPlan:
     """Plan dirty-slot writes for one committed decode token.
 
-    At capacity (``len(heavy)==k`` and ``len(recent)==k``), the new token
-    always lands in the aged-out recent's physical slot (paper circular
-    recent). The unique dropped position frees a slot for ``new_pos``;
-    when the aged-out token is promoted into heavy, its KV is copied into
-    the evicted heavy's slot first.
+    At capacity, the new token lands in the aged-out recent's physical slot.
+    Algorithm-1 may promote that token into heavy; bi-window state keeps heavy
+    frozen and simply rotates its larger recent window.
     """
     if state.k <= 0:
         raise ValueError("empty H2O budget")
-    at_capacity = len(state.recent) == state.k and len(state.heavy) == state.k
+    at_capacity = (
+        len(set(state.heavy) | set(state.recent)) == layout.num_keep
+        and len(state.heavy) == state.k
+    )
     state_after = decode_step(state, new_pos, new_scores_delta)
 
     if not at_capacity:

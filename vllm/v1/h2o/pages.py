@@ -64,6 +64,33 @@ def gather_kv_from_slots(
     return torch.stack(keys, dim=0), torch.stack(values, dim=0)
 
 
+class _FaKvGather:
+    def __init__(self, key_cache: torch.Tensor, value_cache: torch.Tensor) -> None:
+        self._key_cache = key_cache
+        self._value_cache = value_cache
+
+    def gather_kv(
+        self,
+        *,
+        request_index: int,
+        slots: list[int],
+        seq_len: int,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del request_index
+        return gather_kv_from_slots(
+            self._key_cache,
+            self._value_cache,
+            slots[:seq_len],
+            block_size=block_size,
+        )
+
+
+def fa_kv_gather(key_cache: torch.Tensor, value_cache: torch.Tensor) -> _FaKvGather:
+    """Return a FlashAttention page gather closed over one layer's cache."""
+    return _FaKvGather(key_cache, value_cache)
+
+
 def gather_kv_for_positions(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,

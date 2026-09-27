@@ -9,14 +9,19 @@ from __future__ import annotations
 import torch
 
 from vllm import envs
-from vllm.v1.h2o.compress import after_full_attention_kv_update
+from vllm.v1.h2o.bi_snap import bi_snap_budget, select_bi_snap
 from vllm.v1.h2o.context import get_h2o_batch_context
-from vllm.v1.h2o.ownership import num_keep_tokens
 from vllm.v1.h2o.runtime import (
+    drop_prefill_q,
     get_h2o_runtime,
-    get_or_create_prefill_mass,
+    get_or_create_prefill_q,
     set_h2o_layer_runtime,
     stash_decode_queries,
+)
+from vllm.v1.h2o.scores import (
+    KvGather,
+    accumulate_attention_mass_chunked,
+    mass_dict,
 )
 from vllm.v1.h2o.slots import build_slot_layout
 from vllm.v1.h2o.writers import KeptKvWriter
@@ -26,18 +31,17 @@ def run_h2o_after_attention(
     *,
     layer_name: str,
     query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
     slot_mapping: torch.Tensor,
     block_size: int,
+    gather: KvGather,
     writer: KeptKvWriter,
     scale: float,
     sliding_window: tuple[int, int] | None = None,
 ) -> None:
-    """Accumulate S2 mass / end-of-prefill pack / stash decode Q.
+    """Stash observation Q / gather-score-pack at end of prefill / stash decode Q.
 
     Call from FA or KVarN after the layer attention forward when ``VLLM_H2O``.
-    ``writer`` packs Algorithm-1 kept K/V into leading pages for that backend.
+    ``gather`` materializes full K/V once; ``writer`` packs selected K/V.
     """
     if not envs.VLLM_H2O:
         return
@@ -50,10 +54,8 @@ def run_h2o_after_attention(
     if ctx is None or not ctx.requests or ctx.positions is None:
         return
 
-    for req in ctx.requests:
+    for request_index, req in enumerate(ctx.requests):
         q = query[req.token_start : req.token_end]
-        k = key[req.token_start : req.token_end]
-        v = value[req.token_start : req.token_end]
         pos = ctx.positions[req.token_start : req.token_end].tolist()
 
         if req.num_computed_tokens >= req.prompt_len:
@@ -67,62 +69,57 @@ def run_h2o_after_attention(
                 )
             continue
 
-        mass_acc = get_or_create_prefill_mass(
+        stash = get_or_create_prefill_q(
             req.request_id,
             layer_name=layer_name,
             prompt_len=req.prompt_len,
         )
         slots = slot_mapping[req.token_start : req.token_end]
-        mass_acc.note_slots(slots.tolist(), block_size=block_size)
-        mass_acc.update(
+        stash.observe(
             q,
-            k,
-            q_positions=pos,
-            k_positions=pos,
-            scale=scale,
-            v=v,
+            positions=pos,
+            slots=slots.tolist(),
+            block_size=block_size,
         )
 
         if not req.is_last_prefill_chunk:
             continue
 
-        if q.shape[0] == req.prompt_len:
-            out = after_full_attention_kv_update(
-                key=k,
-                value=v,
-                query=q,
-                positions=pos,
-                is_last_prefill_chunk=True,
-                num_computed_tokens=req.prompt_len,
-                prompt_len=req.prompt_len,
-                sliding_window=sliding_window,
-            )
-        else:
-            full = mass_acc.full_kv()
-            if full is None:
-                continue
-            k_full, v_full, pos_full = full
-            out = after_full_attention_kv_update(
-                key=k_full,
-                value=v_full,
-                query=None,
-                positions=pos_full,
-                is_last_prefill_chunk=True,
-                num_computed_tokens=req.prompt_len,
-                prompt_len=req.prompt_len,
-                sliding_window=sliding_window,
-                mass=mass_acc.mass,
-            )
-        if out is None:
+        _, recent_len, _ = bi_snap_budget(
+            req.prompt_len, ratio=float(envs.VLLM_H2O_RATIO)
+        )
+        if recent_len >= req.prompt_len:
+            drop_prefill_q(req.request_id, layer_name=layer_name)
             continue
-        state, k_out, v_out, pos_out = out
-        # PrefillMassAccumulator keeps K/V on CPU (3090 headroom); pages are GPU.
-        if k_out.device != query.device:
-            k_out = k_out.to(device=query.device)
-            v_out = v_out.to(device=query.device)
-        keep_n = num_keep_tokens(req.prompt_len, float(envs.VLLM_H2O_RATIO))
-        need_blocks = (keep_n + block_size - 1) // block_size if keep_n else 0
-        block_ids = list(mass_acc.block_ids[:need_blocks])
+
+        q_obs, q_positions = stash.observations()
+        k_full, v_full = gather.gather_kv(
+            request_index=request_index,
+            slots=stash.slots,
+            seq_len=req.prompt_len,
+            block_size=block_size,
+        )
+        if k_full.shape[0] != req.prompt_len or v_full.shape[0] != req.prompt_len:
+            raise ValueError("gathered K/V length does not match prompt_len")
+        k_positions = list(range(req.prompt_len))
+        mass = accumulate_attention_mass_chunked(
+            q_obs,
+            k_full,
+            scale=scale,
+            q_positions=q_positions,
+            k_positions=k_positions,
+        )
+        state = select_bi_snap(
+            mass_dict(mass, k_positions),
+            req.prompt_len,
+            ratio=float(envs.VLLM_H2O_RATIO),
+        )
+        pos_out = sorted(set(state.heavy) | set(state.recent))
+        k_out = k_full[pos_out]
+        v_out = v_full[pos_out]
+
+        need_blocks = (len(pos_out) + block_size - 1) // block_size
+        block_ids = list(stash.block_ids[:need_blocks])
         if len(block_ids) < need_blocks:
             seen = set(block_ids)
             for s in slots.tolist():

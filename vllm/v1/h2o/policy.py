@@ -24,6 +24,7 @@ class H2OState:
     heavy: list[int]
     recent: list[int]
     scores: dict[int, float] = field(default_factory=dict)
+    update_heavy: bool = True
 
 
 def select_prefill(scores: dict[int, float], prompt_len: int, k: int) -> H2OState:
@@ -55,6 +56,17 @@ def decode_step(
 ) -> H2OState:
     if state.k <= 0:
         return state
+    if not state.update_heavy:
+        recent = [*state.recent[1:], new_pos]
+        keep = set(state.heavy) | set(recent)
+        scores = {p: state.scores.get(p, 0.0) for p in keep}
+        return H2OState(
+            k=state.k,
+            heavy=list(state.heavy),
+            recent=recent,
+            scores=scores,
+            update_heavy=False,
+        )
     scores = dict(state.scores)
     for p, d in new_scores_delta.items():
         if p in scores or p == new_pos:

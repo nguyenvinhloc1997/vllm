@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # vllm/v1/h2o/writers.py
-"""Backend page writers for H2O Algorithm-1 pack (approach B)."""
+"""Backend page writers for H2O selected-K/V packing."""
 
 from __future__ import annotations
 

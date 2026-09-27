@@ -4,7 +4,21 @@
 # vllm/v1/h2o/scores.py
 from __future__ import annotations
 
+from typing import Protocol
+
 import torch
+
+
+class KvGather(Protocol):
+    def gather_kv(
+        self,
+        *,
+        request_index: int,
+        slots: list[int],
+        seq_len: int,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Materialize one request's full K/V sequence on the scoring device."""
 
 
 def accumulate_attention_mass(

@@ -40,7 +40,7 @@ def select_bi_snap(
     """
     del w0  # mass already incorporates both windows
     if prompt_len <= 0:
-        return H2OState(k=0, heavy=[], recent=[], scores={})
+        return H2OState(k=0, heavy=[], recent=[], scores={}, update_heavy=False)
 
     keep_n, r, m = bi_snap_budget(prompt_len, ratio=ratio, w=w)
     if keep is not None:
@@ -59,6 +59,7 @@ def select_bi_snap(
             heavy=[],
             recent=positions,
             scores={p: float(mass.get(p, 0.0)) for p in positions},
+            update_heavy=False,
         )
 
     recent = list(range(prompt_len - r, prompt_len))
@@ -71,4 +72,5 @@ def select_bi_snap(
         heavy=heavy,
         recent=recent,
         scores={p: float(mass.get(p, 0.0)) for p in keep_set},
+        update_heavy=False,
     )

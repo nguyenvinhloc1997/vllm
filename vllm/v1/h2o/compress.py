@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # vllm/v1/h2o/compress.py
-"""Prefill KV compress orchestration for H2O (Algorithm 1).
+"""Prefill KV compression helpers for H2O.
 
-Production scoring uses S2 chunked mass (never ``T×T``). Ownership-A block
-table resize lives on the KV manager; this module selects, gathers, and can
-repack kept K/V into the leading pages of a paged cache.
+Production bi-window scoring stashes only observation queries and gathers K/V
+from backend pages once. Ownership-A block-table resize lives on the KV manager.
 """
 
 from __future__ import annotations
@@ -17,8 +16,9 @@ import torch
 
 from vllm import envs
 from vllm.utils.math_utils import cdiv
+from vllm.v1.h2o.bi_snap import select_bi_snap
 from vllm.v1.h2o.ownership import num_keep_tokens
-from vllm.v1.h2o.policy import H2OState, compute_k, select_prefill
+from vllm.v1.h2o.policy import H2OState
 from vllm.v1.h2o.scores import accumulate_attention_mass_chunked
 
 
@@ -91,13 +91,18 @@ def compress_prefill_kv(
         raise ValueError(f"mass length {mass.numel()} != key length {t}")
 
     local_scores = {i: float(mass[i].item()) for i in range(t)}
-    k_budget = compute_k(t, ratio)
-    local_state = select_prefill(local_scores, t, k_budget)
+    local_state = select_bi_snap(local_scores, t, ratio=ratio)
 
     heavy = [positions[i] for i in local_state.heavy]
     recent = [positions[i] for i in local_state.recent]
     scores = {positions[i]: s for i, s in local_state.scores.items()}
-    state = H2OState(k=local_state.k, heavy=heavy, recent=recent, scores=scores)
+    state = H2OState(
+        k=local_state.k,
+        heavy=heavy,
+        recent=recent,
+        scores=scores,
+        update_heavy=local_state.update_heavy,
+    )
 
     keep_local = sorted(set(local_state.heavy) | set(local_state.recent))
     positions_out = [positions[i] for i in keep_local]
@@ -140,140 +145,84 @@ def is_full_attention_sliding_window(
 
 
 @dataclass
-class PrefillMassAccumulator:
-    """Accumulate S2 mass across chunked-prefill tiles for one request/layer.
-
-    Buffers K/V by absolute (or local) position so the last chunk can compress
-    from the full prompt without a second page gather when callers stream
-    chunk tensors. Mass for each chunk is scored against all keys buffered so
-    far (causal via absolute positions).
-    """
+class PrefillQStash:
+    """Keep the two observation-query windows and page locations for prefill."""
 
     prompt_len: int
-    mass: torch.Tensor = field(init=False)
-    k_buf: torch.Tensor | None = field(default=None, init=False, repr=False)
-    v_buf: torch.Tensor | None = field(default=None, init=False, repr=False)
-    filled: torch.Tensor = field(init=False, repr=False)
-    # Physical FA block ids observed across chunks (order preserved).
+    w0: int = 256
+    w: int = 256
+    q_front: torch.Tensor | None = field(default=None, init=False, repr=False)
+    q_tail: torch.Tensor | None = field(default=None, init=False, repr=False)
+    _front_positions: list[int] = field(default_factory=list, init=False, repr=False)
+    _tail_positions: list[int] = field(default_factory=list, init=False, repr=False)
+    _slots: list[int] = field(default_factory=list, init=False, repr=False)
     block_ids: list[int] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
-        self.mass = torch.zeros(self.prompt_len, dtype=torch.float32)
-        self.filled = torch.zeros(self.prompt_len, dtype=torch.bool)
+        self._front_positions = [-1] * self.w0
+        self._tail_positions = [-1] * self.w
+        self._slots = [-1] * self.prompt_len
         self.block_ids = []
 
-    def note_slots(self, slots: list[int], *, block_size: int) -> None:
-        """Record physical block ids touched by this chunk's slot_mapping."""
-        seen = set(self.block_ids)
-        for s in slots:
-            if s < 0:
-                continue
-            bid = int(s) // block_size
-            if bid not in seen:
-                seen.add(bid)
-                self.block_ids.append(bid)
+    @property
+    def slots(self) -> list[int]:
+        return list(self._slots)
 
-    def _ensure_kv_buffers(self, k: torch.Tensor, v: torch.Tensor) -> None:
-        if self.k_buf is not None:
-            return
-        h, d = k.shape[1], k.shape[2]
-        # Host-side buffers: live CTX=huge already pins the 3090; keeping a
-        # full-prompt K/V copy per FA layer on GPU OOMs during chunked prefill.
-        self.k_buf = torch.zeros(self.prompt_len, h, d, device="cpu", dtype=k.dtype)
-        self.v_buf = torch.zeros(self.prompt_len, h, d, device="cpu", dtype=v.dtype)
-
-    def _local_index(self, pos: int, order_i: int) -> int | None:
-        if 0 <= pos < self.prompt_len:
-            return pos
-        if 0 <= order_i < self.prompt_len:
-            return order_i
-        return None
-
-    def buffer_kv(
-        self,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        positions: list[int],
-    ) -> None:
-        """Store this chunk's K/V into the prompt-sized buffers (CPU)."""
-        if len(positions) != k.shape[0] or k.shape[0] != v.shape[0]:
-            raise ValueError("k/v/positions length mismatch")
-        self._ensure_kv_buffers(k, v)
-        assert self.k_buf is not None and self.v_buf is not None
-        k_cpu = k.detach().to("cpu")
-        v_cpu = v.detach().to("cpu")
-        for i, pos in enumerate(positions):
-            idx = self._local_index(int(pos), i)
-            if idx is None:
-                continue
-            self.k_buf[idx].copy_(k_cpu[i])
-            self.v_buf[idx].copy_(v_cpu[i])
-            self.filled[idx] = True
-
-    def update(
+    def observe(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
         *,
-        q_positions: list[int],
-        k_positions: list[int],
-        scale: float | None = None,
-        tile_q: int = 64,
-        tile_k: int = 64,
-        v: torch.Tensor | None = None,
+        positions: list[int],
+        slots: list[int],
+        block_size: int,
     ) -> None:
-        if scale is None:
-            scale = q.shape[-1] ** -0.5
-        if len(k_positions) > self.prompt_len:
-            raise ValueError("k_positions exceed prompt_len")
-        if v is not None:
-            self.buffer_kv(k, v, k_positions)
-            # Score chunk Q against all keys buffered so far (both on CPU).
-            filled_idx = self.filled.nonzero(as_tuple=False).flatten().tolist()
-            if not filled_idx:
-                return
-            assert self.k_buf is not None
-            q_cpu = q.detach().to("cpu")
-            k_all = self.k_buf[filled_idx]
-            chunk_mass = accumulate_attention_mass_chunked(
-                q_cpu,
-                k_all,
-                scale=scale,
-                tile_q=tile_q,
-                tile_k=tile_k,
-                q_positions=q_positions,
-                k_positions=filled_idx,
+        """Stash front/tail Q rows and physical slots from one prefill chunk."""
+        if len(positions) != q.shape[0] or len(slots) != q.shape[0]:
+            raise ValueError("q/positions/slots length mismatch")
+        if self.q_front is None:
+            shape = (self.w0, q.shape[1], q.shape[2])
+            self.q_front = torch.empty(shape, device=q.device, dtype=q.dtype)
+            self.q_tail = torch.empty(
+                (self.w, q.shape[1], q.shape[2]), device=q.device, dtype=q.dtype
             )
-            for i, pos in enumerate(filled_idx):
-                self.mass[pos] += chunk_mass[i].to(self.mass.device)
-            return
+        assert self.q_tail is not None
 
-        q_cpu = q.detach().to(self.mass.device)
-        k_cpu = k.detach().to(self.mass.device)
-        chunk_mass = accumulate_attention_mass_chunked(
-            q_cpu,
-            k_cpu,
-            scale=scale,
-            tile_q=tile_q,
-            tile_k=tile_k,
-            q_positions=q_positions,
-            k_positions=k_positions,
+        seen = set(self.block_ids)
+        for i, (pos, slot) in enumerate(zip(positions, slots)):
+            pos = int(pos)
+            slot = int(slot)
+            if 0 <= pos < self.prompt_len:
+                self._slots[pos] = slot
+            if 0 <= pos < self.w0:
+                self.q_front[pos].copy_(q[i].detach())
+                self._front_positions[pos] = pos
+            tail_i = pos % self.w
+            self.q_tail[tail_i].copy_(q[i].detach())
+            self._tail_positions[tail_i] = pos
+            if slot >= 0:
+                bid = slot // block_size
+                if bid not in seen:
+                    seen.add(bid)
+                    self.block_ids.append(bid)
+
+    def observations(self) -> tuple[torch.Tensor, list[int]]:
+        """Return deduplicated observation Q rows in absolute-position order."""
+        if self.q_front is None or self.q_tail is None:
+            raise RuntimeError("no prefill queries observed")
+        rows = {
+            pos: self.q_front[i]
+            for i, pos in enumerate(self._front_positions)
+            if pos >= 0
+        }
+        rows.update(
+            {
+                pos: self.q_tail[i]
+                for i, pos in enumerate(self._tail_positions)
+                if pos >= 0
+            }
         )
-        for i, pos in enumerate(k_positions):
-            idx = self._local_index(int(pos), i)
-            if idx is not None:
-                self.mass[idx] += chunk_mass[i]
-
-    def full_kv(
-        self,
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int]] | None:
-        """Return dense prompt K/V when every position has been buffered."""
-        if self.k_buf is None or self.v_buf is None:
-            return None
-        if not bool(self.filled.all().item()):
-            return None
-        positions = list(range(self.prompt_len))
-        return self.k_buf, self.v_buf, positions
+        positions = sorted(rows)
+        return torch.stack([rows[pos] for pos in positions]), positions
 
 
 def repack_kv_into_pages(
