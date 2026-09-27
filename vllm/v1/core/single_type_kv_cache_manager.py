@@ -535,9 +535,11 @@ class SingleTypeKVCacheManager(ABC):
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
         self.h2o_num_tokens.pop(request_id, None)
+        # Pending retained alloc: only free if still pending (not yet swapped).
+        # Shared-follower managers may hold the same block objects; coordinator
+        # abort/swap clears followers without double-freeing.
         pending = self.h2o_pending_blocks.pop(request_id, None)
         if pending:
-            # Pending retained alloc never attached; free with the rest.
             req_blocks = list(req_blocks) + list(pending)
         return req_blocks
 

@@ -395,45 +395,70 @@ class KVCacheCoordinator(ABC):
             )
 
     def resize_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
-        """Swap (or legacy resize) each full-attention group; skip GDN/Mamba/SWA."""
+        """Swap FA groups to the shared retained block list."""
         from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
         from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-        for manager in self.single_type_managers:
-            if not isinstance(manager, FullAttentionManager):
-                continue
-            if type(manager.kv_cache_spec) is not FullAttentionSpec:
-                continue
-            manager.swap_after_h2o_compress(request_id, num_keep_tokens)
+        fa_managers = [
+            m
+            for m in self.single_type_managers
+            if isinstance(m, FullAttentionManager)
+            and type(m.kv_cache_spec) is FullAttentionSpec
+        ]
+        if not fa_managers:
+            return
+        # Owner swaps first (consumes pending, frees old).
+        fa_managers[0].swap_after_h2o_compress(request_id, num_keep_tokens)
+        shared = list(fa_managers[0].req_to_blocks.get(request_id, []))
+        for manager in fa_managers[1:]:
+            # Drop follower pending without freeing (owner owns those blocks).
+            manager.h2o_pending_blocks.pop(request_id, None)
+            old = manager.req_to_blocks.get(request_id, [])
+            manager.req_to_blocks[request_id] = list(shared)
+            if old:
+                manager.block_pool.free_blocks(reversed(old))
+            if request_id in manager.num_cached_block:
+                manager.num_cached_block[request_id] = min(
+                    manager.num_cached_block[request_id], len(shared)
+                )
+            manager.h2o_num_tokens[request_id] = num_keep_tokens
 
     def allocate_h2o_retained(self, request_id: str, num_keep_tokens: int) -> list[int]:
-        """Pre-allocate retained FA blocks for H2O pack; return physical ids."""
+        """Pre-allocate retained FA blocks once; share across FA managers."""
         from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
         from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-        ids: list[int] | None = None
-        for manager in self.single_type_managers:
-            if not isinstance(manager, FullAttentionManager):
-                continue
-            if type(manager.kv_cache_spec) is not FullAttentionSpec:
-                continue
-            got = manager.allocate_h2o_retained(request_id, num_keep_tokens)
-            if ids is None:
-                ids = got
-            elif got != ids:
-                raise RuntimeError("H2O retained block ids differ across FA managers")
-        return ids or []
+        fa_managers = [
+            m
+            for m in self.single_type_managers
+            if isinstance(m, FullAttentionManager)
+            and type(m.kv_cache_spec) is FullAttentionSpec
+        ]
+        if not fa_managers:
+            return []
+        # One get_new_blocks for all FA groups; others reuse the same physicals.
+        ids = fa_managers[0].allocate_h2o_retained(request_id, num_keep_tokens)
+        shared = fa_managers[0].h2o_pending_blocks.get(request_id, [])
+        for manager in fa_managers[1:]:
+            manager.h2o_pending_blocks[request_id] = list(shared)
+        return ids
 
     def abort_h2o_retained(self, request_id: str) -> None:
         from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
         from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-        for manager in self.single_type_managers:
-            if not isinstance(manager, FullAttentionManager):
-                continue
-            if type(manager.kv_cache_spec) is not FullAttentionSpec:
-                continue
-            manager.abort_h2o_retained(request_id)
+        fa_managers = [
+            m
+            for m in self.single_type_managers
+            if isinstance(m, FullAttentionManager)
+            and type(m.kv_cache_spec) is FullAttentionSpec
+        ]
+        if not fa_managers:
+            return
+        # Shared pending — free once via the owner manager.
+        fa_managers[0].abort_h2o_retained(request_id)
+        for manager in fa_managers[1:]:
+            manager.h2o_pending_blocks.pop(request_id, None)
 
     def swap_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
         self.resize_h2o_full_attention(request_id, num_keep_tokens)
