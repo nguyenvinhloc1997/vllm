@@ -115,10 +115,16 @@ def _stash_aged_slots_for_request(
     req_id: str,
     forward_ctx: Mapping[str, Any],
 ) -> int | None:
-    """Stash aged-recent KV; return circular write slot from the first layer."""
+    """Stash aged-recent KV; return circular write slot from the first layer.
+
+    FA pages get an aged-slot stash for promote-copy. KVarN (and other non-FA)
+    layouts still return the circular write slot for ``slot_mapping`` remap but
+    skip FA ``split_fa_kv_cache`` / slot reads.
+    """
     from vllm.v1.h2o.decode import next_decode_write_slot
     from vllm.v1.h2o.pages import (
         head_size_from_fa_kv_cache,
+        is_fa_paged_kv_cache,
         read_slot_kv,
         split_fa_kv_cache,
     )
@@ -135,6 +141,8 @@ def _stash_aged_slots_for_request(
             continue
         kv = attn.kv_cache
         if not isinstance(kv, torch.Tensor) or kv.numel() == 0:
+            continue
+        if not is_fa_paged_kv_cache(kv):
             continue
         head_size = head_size_from_fa_kv_cache(kv)
         key_cache, value_cache = split_fa_kv_cache(kv, head_size)

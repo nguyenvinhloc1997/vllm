@@ -81,6 +81,28 @@ def test_decode_skips_fa_split_on_kvarn_layout(monkeypatch):
     clear_h2o_runtime(req_id)
 
 
+def test_stash_aged_slots_skips_fa_split_on_kvarn_layout(monkeypatch):
+    """Decode slot remap must not FA-split KVarN pages when stashing aged KV."""
+    monkeypatch.setattr(envs, "VLLM_H2O", True)
+    req_id = "r-kvarn-stash"
+    layer_name = "layers.3.self_attn.attn"
+    _seed_runtime(req_id, layer_name)
+    kvarn_kv = torch.zeros(4, 2, 256, dtype=torch.uint8)
+    forward_ctx = {layer_name: SimpleNamespace(kv_cache=kvarn_kv)}
+
+    import vllm.v1.h2o.pages as pages
+    from vllm.v1.h2o.runner_hooks import _stash_aged_slots_for_request
+
+    monkeypatch.setattr(
+        pages,
+        "split_fa_kv_cache",
+        MagicMock(side_effect=AssertionError("must not split KVarN")),
+    )
+    write_slot = _stash_aged_slots_for_request(req_id=req_id, forward_ctx=forward_ctx)
+    assert write_slot is not None
+    clear_h2o_runtime(req_id)
+
+
 def test_is_fa_paged_kv_cache_detects_layouts():
     from vllm.v1.h2o.pages import is_fa_paged_kv_cache
 
