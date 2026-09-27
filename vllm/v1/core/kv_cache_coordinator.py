@@ -394,17 +394,22 @@ class KVCacheCoordinator(ABC):
                 request_id, processed_computed_tokens, num_prompt_tokens
             )
 
-    def resize_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
-        """Swap FA groups to the shared retained block list."""
+    def _compress_fa_managers(self):
+        """Full-attention managers that participate in H2O compress (not protect)."""
         from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
         from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-        fa_managers = [
+        return [
             m
             for m in self.single_type_managers
             if isinstance(m, FullAttentionManager)
             and type(m.kv_cache_spec) is FullAttentionSpec
+            and not m.kv_cache_spec.h2o_protect
         ]
+
+    def resize_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
+        """Swap compress-FA groups to the shared retained block list."""
+        fa_managers = self._compress_fa_managers()
         if not fa_managers:
             return
         # Owner swaps first (consumes pending, frees old).
@@ -428,20 +433,14 @@ class KVCacheCoordinator(ABC):
             manager.h2o_num_tokens[request_id] = num_keep_tokens
 
     def allocate_h2o_retained(self, request_id: str, num_keep_tokens: int) -> list[int]:
-        """Pre-allocate retained FA blocks once; share across FA managers."""
+        """Pre-allocate retained blocks once; share across compress-FA managers."""
         from vllm.logger import init_logger
-        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
-        from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-        fa_managers = [
-            m
-            for m in self.single_type_managers
-            if isinstance(m, FullAttentionManager)
-            and type(m.kv_cache_spec) is FullAttentionSpec
-        ]
+        fa_managers = self._compress_fa_managers()
         if not fa_managers:
             return []
-        # One get_new_blocks for all FA groups; others reuse the same physicals.
+        # One get_new_blocks for all compress FA groups; others reuse the same
+        # physicals. Protect FA managers are excluded.
         ids = fa_managers[0].allocate_h2o_retained(request_id, num_keep_tokens)
         shared = fa_managers[0].h2o_pending_blocks.get(request_id, [])
         for manager in fa_managers[1:]:
@@ -455,15 +454,7 @@ class KVCacheCoordinator(ABC):
         return ids
 
     def abort_h2o_retained(self, request_id: str) -> None:
-        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
-        from vllm.v1.kv_cache_interface import FullAttentionSpec
-
-        fa_managers = [
-            m
-            for m in self.single_type_managers
-            if isinstance(m, FullAttentionManager)
-            and type(m.kv_cache_spec) is FullAttentionSpec
-        ]
+        fa_managers = self._compress_fa_managers()
         if not fa_managers:
             return
         # Shared pending — free once via the owner manager.

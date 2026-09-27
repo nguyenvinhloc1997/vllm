@@ -10,6 +10,7 @@ import torch
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.h2o.bi_snap import bi_snap_budget, select_bi_snap
 from vllm.v1.h2o.context import get_h2o_batch_context
 from vllm.v1.h2o.runtime import (
@@ -61,7 +62,26 @@ def run_h2o_after_attention(
     if ctx is None or not ctx.requests or ctx.positions is None:
         return
 
+    try:
+        protect_layer_idx = extract_layer_index(layer_name)
+    except (AssertionError, ValueError, IndexError):
+        protect_layer_idx = None
+    is_protect_layer = (
+        protect_layer_idx is not None
+        and protect_layer_idx in envs.VLLM_H2O_PROTECT_FA_LAYERS
+    )
+
     for request_index, req in enumerate(ctx.requests):
+        if is_protect_layer:
+            # Skip pack/stash; do not fail the whole request because protect
+            # layers are intentionally excluded from H2O compress.
+            logger.info(
+                "[H2O_DIAG] pack_skip protect_layer req=%s layer=%s",
+                req.request_id,
+                layer_name,
+            )
+            continue
+
         q = query[req.token_start : req.token_end]
         pos = ctx.positions[req.token_start : req.token_end].tolist()
 
