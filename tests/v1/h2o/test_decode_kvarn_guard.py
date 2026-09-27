@@ -103,6 +103,39 @@ def test_stash_aged_slots_skips_fa_split_on_kvarn_layout(monkeypatch):
     clear_h2o_runtime(req_id)
 
 
+def test_iter_h2o_decode_slot_remaps_covers_full_query_span(monkeypatch):
+    """DFlash schedules N>1 tokens; all must share the circular write slot.
+
+    After Ownership-A the absolute TOKEN_TO_KV_SLOT indices walk past the
+    truncated block table. Remapping only tok0 leaves draft slots OOB and
+    hangs KVarN decode on the live dflash2 path.
+    """
+    monkeypatch.setattr(envs, "VLLM_H2O", True)
+    req_id = "r-dflash-remap"
+    layer_name = "layers.3.self_attn.attn"
+    _seed_runtime(req_id, layer_name, prompt_len=40)
+    kvarn_kv = torch.zeros(4, 2, 256, dtype=torch.uint8)
+    forward_ctx = {layer_name: SimpleNamespace(kv_cache=kvarn_kv)}
+
+    from vllm.v1.h2o.runner_hooks import iter_h2o_decode_slot_remaps
+    from vllm.v1.h2o.slots import remap_decode_write_slot
+
+    layer_rt = get_layer_rt(req_id, layer_name)
+    expected = remap_decode_write_slot(layer_rt.state, layer_rt.layout)
+    # Spec width 8: query span [10, 18)
+    remaps = list(
+        iter_h2o_decode_slot_remaps(
+            req_ids=[req_id],
+            num_computed_tokens=[40],
+            query_start_loc_np=__import__("numpy").asarray([10, 18]),
+            forward_ctx=forward_ctx,
+        )
+    )
+    assert [t for t, _ in remaps] == list(range(10, 18))
+    assert all(slot == expected for _, slot in remaps)
+    clear_h2o_runtime(req_id)
+
+
 def test_is_fa_paged_kv_cache_detects_layouts():
     from vllm.v1.h2o.pages import is_fa_paged_kv_cache
 

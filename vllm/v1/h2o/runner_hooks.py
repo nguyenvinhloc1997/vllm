@@ -166,10 +166,13 @@ def iter_h2o_decode_slot_remaps(
     query_start_loc_np: np.ndarray,
     forward_ctx: Mapping[str, Any],
 ):
-    """Yield ``(tok0, write_slot)`` for decode requests needing remap + stash.
+    """Yield ``(tok_idx, write_slot)`` for every decode token needing remap.
 
-    Prefill rows are skipped. Spec drafts share the circular head until
-    post-commit (DFlash width unchanged).
+    Prefill rows are skipped. After Ownership-A the absolute
+    ``TOKEN_TO_KV_SLOT`` indices walk past the truncated block table, so
+    **every** scheduled token in the query span (greedy or DFlash drafts)
+    must land on the circular-recent head. Spec drafts share that one slot
+    until post-commit advances the window — DFlash width is unchanged.
     """
     if not envs.VLLM_H2O:
         return
@@ -191,7 +194,8 @@ def iter_h2o_decode_slot_remaps(
         tok1 = int(query_start_loc_np[i + 1])
         if tok1 <= tok0:
             continue
-        yield tok0, write_slot
+        for tok_idx in range(tok0, tok1):
+            yield tok_idx, write_slot
 
 
 def maybe_remap_h2o_decode_slots_gpu(
@@ -242,9 +246,9 @@ def maybe_remap_h2o_decode_slots_gpu(
         fa_group_indices.append(g_idx)
     if not fa_group_indices:
         return
-    for tok0, write_slot in remaps:
+    for tok_idx, write_slot in remaps:
         for g_idx in fa_group_indices:
-            slot_mappings[g_idx, tok0] = write_slot
+            slot_mappings[g_idx, tok_idx] = write_slot
 
 
 def h2o_decode_after_commit(

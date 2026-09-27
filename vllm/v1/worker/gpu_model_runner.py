@@ -4224,14 +4224,14 @@ class GPUModelRunner(
         )
         if not remaps:
             return
-        for tok0, write_slot in remaps:
+        for tok_idx, write_slot in remaps:
             for bt in block_tables:
                 if bt.slot_mapping_mode != SlotMappingMode.TOKEN_TO_KV_SLOT:
                     continue
-                # Greedy decode: one new token → circular recent head.
-                # Spec drafts share this slot until post-commit rewrite;
+                # Every scheduled token (greedy or DFlash drafts) → circular
+                # recent head. Drafts share one slot until post-commit;
                 # do not widen DFlash num_query_per_req.
-                bt.slot_mapping.np[tok0] = write_slot
+                bt.slot_mapping.np[tok_idx] = write_slot
         for bt in block_tables:
             if bt.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT:
                 bt.slot_mapping.copy_to_gpu(total_num_scheduled_tokens)
