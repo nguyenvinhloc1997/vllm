@@ -265,12 +265,20 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
+    h2o_fa_seq_lens: torch.Tensor | None = None,
+    h2o_fa_seq_lens_cpu_upper_bound: torch.Tensor | None = None,
 ) -> dict[str, Any]:
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
     if seq_lens_cpu_upper_bound is not None:
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
+    if h2o_fa_seq_lens is not None:
+        h2o_fa_seq_lens = h2o_fa_seq_lens[:num_reqs]
+    if h2o_fa_seq_lens_cpu_upper_bound is not None:
+        h2o_fa_seq_lens_cpu_upper_bound = h2o_fa_seq_lens_cpu_upper_bound[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
@@ -292,12 +300,27 @@ def build_attn_metadata(
         group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
             "is_prefilling", is_prefilling
         )
+        # Ownership-A: only full-attention (KVarN) groups read the packed short
+        # KV. GDN/mamba keep absolute seq_lens on the shared batch buffers.
+        group_spec = kv_cache_config.kv_cache_groups[i].kv_cache_spec
+        if h2o_fa_seq_lens is not None and type(group_spec) is FullAttentionSpec:
+            group_seq_lens = h2o_fa_seq_lens
+            group_seq_lens_cpu_ub = (
+                h2o_fa_seq_lens_cpu_upper_bound
+                if h2o_fa_seq_lens_cpu_upper_bound is not None
+                else seq_lens_cpu_upper_bound
+            )
+            group_max_seq_len = int(h2o_fa_seq_lens.max().item())
+        else:
+            group_seq_lens = seq_lens
+            group_seq_lens_cpu_ub = seq_lens_cpu_upper_bound
+            group_max_seq_len = max_seq_len
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            max_seq_len=max_seq_len,
+            seq_lens=group_seq_lens,
+            seq_lens_cpu_upper_bound=group_seq_lens_cpu_ub,
+            max_seq_len=group_max_seq_len,
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,

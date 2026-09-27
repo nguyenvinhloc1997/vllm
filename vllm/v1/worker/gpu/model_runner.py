@@ -1367,16 +1367,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         from vllm import envs as vllm_envs
         from vllm.v1.h2o.runner_hooks import maybe_clamp_h2o_seq_lens
 
-        # Attention seq_lens must match retained KV after Ownership-A. Sampling
-        # uses absolute transcript length so decode is not mistaken for chunked
-        # prefill (seq_len < prefill_len → num_sampled forced to 0).
+        # Shared seq_lens stay absolute (GDN/mamba_align/sampling). Clamp a
+        # FA-only copy for FullAttentionSpec groups in build_attn_metadata.
         if vllm_envs.VLLM_H2O:
-            input_batch.sampling_seq_lens = seq_lens.clone()
-        maybe_clamp_h2o_seq_lens(
-            req_ids,
-            input_batch.seq_lens,
-            input_batch.seq_lens_cpu_upper_bound,
-        )
+            input_batch.h2o_fa_seq_lens = input_batch.seq_lens.clone()
+            input_batch.h2o_fa_seq_lens_cpu_upper_bound = (
+                input_batch.seq_lens_cpu_upper_bound.clone()
+            )
+            maybe_clamp_h2o_seq_lens(
+                req_ids,
+                input_batch.h2o_fa_seq_lens,
+                input_batch.h2o_fa_seq_lens_cpu_upper_bound,
+            )
         return pcp.maybe_partition_pcp_batch(
             self.pcp_manager,
             input_batch,

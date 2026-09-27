@@ -115,6 +115,11 @@ class InputBatch:
     # Absolute transcript seq_lens for sampling when H2O clamps attention
     # seq_lens to retained KV length. None when no clamp applied this step.
     sampling_seq_lens: torch.Tensor | None = None
+    # FA/KVarN-only clamped seq_lens after Ownership-A. Shared seq_lens stay
+    # absolute for GDN/mamba_align; build_attn_metadata uses these for
+    # FullAttentionSpec groups only.
+    h2o_fa_seq_lens: torch.Tensor | None = None
+    h2o_fa_seq_lens_cpu_upper_bound: torch.Tensor | None = None
 
     @classmethod
     def make_dummy(

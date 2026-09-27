@@ -224,5 +224,9 @@ class DefaultModelState(ModelState):
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            h2o_fa_seq_lens=getattr(input_batch, "h2o_fa_seq_lens", None),
+            h2o_fa_seq_lens_cpu_upper_bound=getattr(
+                input_batch, "h2o_fa_seq_lens_cpu_upper_bound", None
+            ),
         )
         return attn_metadata
