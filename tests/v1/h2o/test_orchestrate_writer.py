@@ -135,6 +135,52 @@ def test_chunked_prefill_stashes_windows_and_gathers_only_at_end(monkeypatch):
     clear_h2o_runtime(request_id)
 
 
+def test_partial_prefix_hit_drops_incomplete_stash_without_gather(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_H2O", True)
+    monkeypatch.setattr(envs, "VLLM_H2O_RATIO", 0.5)
+    request_id = "r-partial-prefix"
+    clear_h2o_runtime(request_id)
+    prompt_len, start, h_q, h_kv, d = 600, 200, 2, 1, 4
+    gather = FakeGather(
+        torch.randn(prompt_len, h_kv, d),
+        torch.randn(prompt_len, h_kv, d),
+    )
+    writer = FakeWriter()
+    set_h2o_batch_context(
+        H2OBatchContext(
+            requests=[
+                H2ORequestContext(
+                    request_id=request_id,
+                    num_computed_tokens=start,
+                    prompt_len=prompt_len,
+                    is_last_prefill_chunk=True,
+                    token_start=0,
+                    token_end=prompt_len - start,
+                )
+            ],
+            positions=torch.arange(start, prompt_len),
+        )
+    )
+
+    run_h2o_after_attention(
+        layer_name="layers.3",
+        query=torch.randn(prompt_len - start, h_q, d),
+        slot_mapping=torch.arange(start, prompt_len),
+        block_size=20,
+        gather=gather,
+        writer=writer,
+        scale=d**-0.5,
+        sliding_window=(-1, -1),
+    )
+
+    assert gather.calls == []
+    assert writer.calls == []
+    rt = get_h2o_runtime(request_id)
+    assert rt is not None and rt.prefill_q == {}
+    clear_h2o_batch_context()
+    clear_h2o_runtime(request_id)
+
+
 def test_short_prompt_skips_gather_and_drops_q_stash(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_H2O", True)
     monkeypatch.setattr(envs, "VLLM_H2O_RATIO", 0.4)

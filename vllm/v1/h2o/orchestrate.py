@@ -33,9 +33,11 @@ def run_h2o_after_attention(
     query: torch.Tensor,
     slot_mapping: torch.Tensor,
     block_size: int,
-    gather: KvGather,
     writer: KeptKvWriter,
     scale: float,
+    gather: KvGather | None = None,
+    key: torch.Tensor | None = None,
+    value: torch.Tensor | None = None,
     sliding_window: tuple[int, int] | None = None,
 ) -> None:
     """Stash observation Q / gather-score-pack at end of prefill / stash decode Q.
@@ -44,6 +46,8 @@ def run_h2o_after_attention(
     ``gather`` materializes full K/V once; ``writer`` packs selected K/V.
     """
     if not envs.VLLM_H2O:
+        return
+    if gather is None:
         return
     if sliding_window is not None and (
         sliding_window[0] >= 0 or sliding_window[1] >= 0
@@ -89,13 +93,27 @@ def run_h2o_after_attention(
             req.prompt_len, ratio=float(envs.VLLM_H2O_RATIO)
         )
         if recent_len >= req.prompt_len:
+            # Compression cannot remove anything from a prompt this short.
+            drop_prefill_q(req.request_id, layer_name=layer_name)
+            continue
+
+        all_slots = stash.slots
+        if any(slot < 0 for slot in all_slots):
             drop_prefill_q(req.request_id, layer_name=layer_name)
             continue
 
         q_obs, q_positions = stash.observations()
+        expected_q_positions = sorted(
+            set(range(min(stash.w0, req.prompt_len)))
+            | set(range(max(0, req.prompt_len - stash.w), req.prompt_len))
+        )
+        if q_positions != expected_q_positions:
+            drop_prefill_q(req.request_id, layer_name=layer_name)
+            continue
+
         k_full, v_full = gather.gather_kv(
             request_index=request_index,
-            slots=stash.slots,
+            slots=all_slots,
             seq_len=req.prompt_len,
             block_size=block_size,
         )
