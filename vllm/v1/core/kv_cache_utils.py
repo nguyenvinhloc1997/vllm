@@ -1302,14 +1302,64 @@ def _uniform_page_size_group_size(
     return group_size
 
 
-def _probe_group_size_for_test(kv_cache_spec: dict[str, KVCacheSpec]) -> int:
+def _is_h2o_protect_fa_bucket(specs: list[KVCacheSpec]) -> bool:
+    """True when every spec in the bucket is FullAttentionSpec with h2o_protect."""
+    return bool(specs) and all(
+        isinstance(sp, FullAttentionSpec) and sp.h2o_protect for sp in specs
+    )
+
+
+def _peel_h2o_protect_fa_buckets(
+    kv_cache_spec: dict[str, KVCacheSpec],
+    layer_buckets: list[list[str]],
+    spec_buckets: list[list[KVCacheSpec]],
+) -> tuple[list[KVCacheGroupSpec], list[list[str]], list[list[KVCacheSpec]]]:
+    """Peel all-h2o_protect FA buckets out before equal-size group_size.
+
+    Protect layers become standalone KVCacheGroupSpecs with their real layer
+    counts (never padded to match hybrid group_size). Remaining buckets feed
+    min_num_layers / prefer-SWA as before.
+    """
+    peeled_groups: list[KVCacheGroupSpec] = []
+    kept_layer_buckets: list[list[str]] = []
+    kept_spec_buckets: list[list[KVCacheSpec]] = []
+    for layers, specs in zip(layer_buckets, spec_buckets):
+        if _is_h2o_protect_fa_bucket(specs):
+            peeled_groups.extend(
+                create_kv_cache_group_specs(
+                    {n: kv_cache_spec[n] for n in layers}, [layers]
+                )
+            )
+        else:
+            kept_layer_buckets.append(layers)
+            kept_spec_buckets.append(specs)
+    return peeled_groups, kept_layer_buckets, kept_spec_buckets
+
+
+def _probe_group_size_for_test(
+    kv_cache_spec: dict[str, KVCacheSpec],
+    *,
+    after_peel: bool = False,
+) -> int:
     """Test helper: return the hybrid equal-size group_size for a kv_cache_spec.
 
     Shares bucketing + prefer-SWA with `_get_kv_cache_groups_uniform_page_size`.
-    Used by H2O protect-FA grouping probes (Task 0a) so tests assert the
-    diagnostic directly instead of reverse-engineering pad from group counts.
+    Used by H2O protect-FA grouping probes so tests assert the diagnostic
+    directly instead of reverse-engineering pad from group counts.
+
+    When ``after_peel=True``, all-h2o_protect FA buckets are removed first
+    (same as production grouping). Default ``False`` documents the naive
+    collapse if protect stayed in the equal-size dance.
     """
     layer_buckets, spec_buckets = _uniform_page_size_layer_buckets(kv_cache_spec)
+    if after_peel:
+        _, layer_buckets, spec_buckets = _peel_h2o_protect_fa_buckets(
+            kv_cache_spec, layer_buckets, spec_buckets
+        )
+        if not layer_buckets:
+            raise ValueError(
+                "No KV cache buckets remain after peeling h2o_protect FA layers"
+            )
     return _uniform_page_size_group_size(layer_buckets, spec_buckets)
 
 
@@ -1383,6 +1433,17 @@ def _get_kv_cache_groups_uniform_page_size(
     # -> (full.0, full.1), (sw.0, sw.1, sw.2).
     layer_buckets, spec_buckets = _uniform_page_size_layer_buckets(kv_cache_spec)
 
+    # Peel all-h2o_protect FA buckets before equal-size split so a small
+    # protect set (e.g. 2 draft layers) cannot collapse hybrid group_size
+    # and defeat prefer-SWA. Protect groups keep their real layer counts.
+    peeled_groups, layer_buckets, spec_buckets = _peel_h2o_protect_fa_buckets(
+        kv_cache_spec, layer_buckets, spec_buckets
+    )
+    if not layer_buckets:
+        raise ValueError(
+            "No KV cache buckets remain after peeling h2o_protect FA layers"
+        )
+
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
     # E.g., (full.0, full.1), (sw.0, sw.1, sw.2)
@@ -1419,7 +1480,7 @@ def _get_kv_cache_groups_uniform_page_size(
         # instead of layers[i * group_size: (i + 1) * group_size]
         for i in range(num_groups):
             grouped_layers.append(layers[i::num_groups])
-    return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+    return peeled_groups + create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 
 def _get_per_layer_spec(
