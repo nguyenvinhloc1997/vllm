@@ -255,7 +255,15 @@ def h2o_decode_after_commit(
     commits: dict[str, list[int]],
     forward_ctx: Mapping[str, Any],
 ) -> None:
-    """Apply paper Algorithm 1 decode_step for committed tokens only."""
+    """Advance H2O state for committed decode tokens.
+
+    Bi-window (``update_heavy=False``): circular recent rotate only — never
+    Algorithm-1 FA decode scoring / promote-copy. Spec for this cut forbids
+    every-decode heavy update; live KVarN can be mistaken for FA pages and
+    AssertionError-kills the engine if scoring runs.
+
+    Legacy Algorithm-1 (``update_heavy=True``) may still score on true FA pages.
+    """
     if not envs.VLLM_H2O or not commits:
         return
     from vllm.v1.h2o.decode import (
@@ -274,6 +282,18 @@ def h2o_decode_after_commit(
         if rt is None:
             continue
         for layer_name, layer_rt in rt.layers.items():
+            # Bi-window: policy-only rotate. Do not gate on layout heuristics.
+            if not layer_rt.state.update_heavy:
+                for pos in positions:
+                    apply_committed_decode_step(
+                        layer_rt,
+                        new_pos=int(pos),
+                        new_scores_delta={},
+                    )
+                layer_rt.pending_decode_q = None
+                layer_rt.pending_decode_positions = []
+                continue
+
             attn = forward_ctx.get(layer_name)
             kv = getattr(attn, "kv_cache", None) if attn is not None else None
             use_fa_cache = (
@@ -292,7 +312,7 @@ def h2o_decode_after_commit(
                         value_cache=value_cache,
                     )
             else:
-                # Policy-only: KVarN (and other non-FA) layouts skip FA rewrite.
+                # Non-FA layouts skip FA rewrite even under Algorithm-1.
                 for pos in positions:
                     apply_committed_decode_step(
                         layer_rt,

@@ -172,3 +172,61 @@ def test_decode_after_commit_skips_fa_path_on_kvarn_4d(monkeypatch):
     layer_rt = get_layer_rt(req_id, layer_name)
     assert 40 in (set(layer_rt.state.heavy) | set(layer_rt.state.recent))
     clear_h2o_runtime(req_id)
+
+
+def test_bi_window_decode_never_fa_scores_even_on_fa_pages(monkeypatch):
+    """Option A: update_heavy=False must not enter Alg-1 FA decode scoring.
+
+    Live crash was h2o_decode_after_commit → FA path → accumulate_attention_mass
+    assert on KVarN misdetect. Bi-window freezes heavy; decode is rotate-only.
+    """
+    monkeypatch.setattr(envs, "VLLM_H2O", True)
+    req_id = "r-bi-window-no-fa-score"
+    layer_name = "layers.3.self_attn.attn"
+    clear_h2o_runtime(req_id)
+
+    from vllm.v1.h2o.bi_snap import select_bi_snap
+
+    prompt_len = 40
+    mass = {i: float(40 - i) for i in range(prompt_len)}
+    state = select_bi_snap(mass, prompt_len, ratio=0.4, w=8)
+    assert state.update_heavy is False
+    positions = sorted(set(state.heavy) | set(state.recent))
+    layout = build_slot_layout(positions, block_ids=[0, 1, 2, 3], block_size=8)
+    set_h2o_layer_runtime(
+        req_id,
+        layer_name=layer_name,
+        state=state,
+        layout=layout,
+        prompt_len=prompt_len,
+    )
+
+    # Classic FA-shaped pages — would previously take the scoring path.
+    fa_kv = torch.zeros(4, 2, 8, 256, dtype=torch.float16)  # 2*D=256 → D=128
+    forward_ctx = {layer_name: SimpleNamespace(kv_cache=fa_kv)}
+
+    import vllm.v1.h2o.decode as decode_mod
+    import vllm.v1.h2o.pages as pages
+
+    monkeypatch.setattr(
+        pages,
+        "split_fa_kv_cache",
+        MagicMock(side_effect=AssertionError("bi-window must not FA-split")),
+    )
+    monkeypatch.setattr(
+        decode_mod,
+        "accumulate_attention_mass",
+        MagicMock(side_effect=AssertionError("bi-window must not score")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        decode_mod,
+        "score_committed_decode_delta",
+        MagicMock(side_effect=AssertionError("bi-window must not score")),
+    )
+
+    h2o_decode_after_commit({req_id: [40]}, forward_ctx)
+    layer_rt = get_layer_rt(req_id, layer_name)
+    assert 40 in set(layer_rt.state.recent)
+    assert layer_rt.state.update_heavy is False
+    clear_h2o_runtime(req_id)
