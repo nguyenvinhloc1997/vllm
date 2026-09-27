@@ -411,10 +411,14 @@ class KVCacheCoordinator(ABC):
         fa_managers[0].swap_after_h2o_compress(request_id, num_keep_tokens)
         shared = list(fa_managers[0].req_to_blocks.get(request_id, []))
         for manager in fa_managers[1:]:
-            # Drop follower pending without freeing (owner owns those blocks).
+            # Drop follower pending without freeing (owner owns alloc ref).
             manager.h2o_pending_blocks.pop(request_id, None)
             old = manager.req_to_blocks.get(request_id, [])
             manager.req_to_blocks[request_id] = list(shared)
+            # Each manager that holds the shared blocks needs its own ref so
+            # coordinator.free (per-manager) does not drive ref_cnt negative.
+            for block in shared:
+                block.ref_cnt += 1
             if old:
                 manager.block_pool.free_blocks(reversed(old))
             if request_id in manager.num_cached_block:
@@ -425,6 +429,7 @@ class KVCacheCoordinator(ABC):
 
     def allocate_h2o_retained(self, request_id: str, num_keep_tokens: int) -> list[int]:
         """Pre-allocate retained FA blocks once; share across FA managers."""
+        from vllm.logger import init_logger
         from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
         from vllm.v1.kv_cache_interface import FullAttentionSpec
 
@@ -441,6 +446,12 @@ class KVCacheCoordinator(ABC):
         shared = fa_managers[0].h2o_pending_blocks.get(request_id, [])
         for manager in fa_managers[1:]:
             manager.h2o_pending_blocks[request_id] = list(shared)
+        init_logger(__name__).info(
+            "[H2O_DIAG] alloc_share n_fa=%d pages=%d pool_ids=%s",
+            len(fa_managers),
+            len(ids),
+            [id(m.block_pool) for m in fa_managers],
+        )
         return ids
 
     def abort_h2o_retained(self, request_id: str) -> None:

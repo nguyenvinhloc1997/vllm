@@ -711,16 +711,30 @@ class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
 
     def allocate_h2o_retained(self, request_id: str, num_keep_tokens: int) -> list[int]:
-        """Pre-allocate fresh blocks for H2O pack; do not attach to the table yet.
+        """Pre-allocate fresh manager pages for H2O pack; do not attach yet.
 
-        Returns physical block ids. Idempotent if pending already exists.
+        Returns **manager** physical block ids (hybrid page size, e.g. 1536).
+        The scheduler expands them to kernel tile ids before the worker packs.
+        Idempotent if pending already exists.
         """
+        from vllm.logger import init_logger
+
+        _logger = init_logger(__name__)
         if request_id not in self.req_to_blocks:
             return []
         if num_keep_tokens < 0:
             raise ValueError("num_keep_tokens must be non-negative")
         if request_id in self.h2o_pending_blocks:
-            return [b.block_id for b in self.h2o_pending_blocks[request_id]]
+            pending = self.h2o_pending_blocks[request_id]
+            _logger.info(
+                "[H2O_DIAG] alloc_retained_idempotent req=%s keep=%d "
+                "manager_bs=%d pending=%d",
+                request_id,
+                num_keep_tokens,
+                self.block_size,
+                len(pending),
+            )
+            return [b.block_id for b in pending]
         n = cdiv(num_keep_tokens, self.block_size) if num_keep_tokens else 0
         if n == 0:
             self.h2o_pending_blocks[request_id] = []
@@ -729,6 +743,14 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         self.h2o_pending_blocks[request_id] = new_blocks
         if self._record_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in new_blocks)
+        _logger.info(
+            "[H2O_DIAG] alloc_retained req=%s keep=%d manager_bs=%d n_pages=%d free=%d",
+            request_id,
+            num_keep_tokens,
+            self.block_size,
+            n,
+            self.block_pool.get_num_free_blocks(),
+        )
         return [b.block_id for b in new_blocks]
 
     def abort_h2o_retained(self, request_id: str) -> None:

@@ -599,6 +599,19 @@ class KVCacheManager:
     def allocate_h2o_retained(self, request_id: str, num_keep_tokens: int) -> list[int]:
         return self.coordinator.allocate_h2o_retained(request_id, num_keep_tokens)
 
+    def get_h2o_fa_block_size(self) -> int:
+        """Manager page size for the primary full-attention group (hybrid-aware)."""
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        for manager in self.coordinator.single_type_managers:
+            if (
+                isinstance(manager, FullAttentionManager)
+                and type(manager.kv_cache_spec) is FullAttentionSpec
+            ):
+                return int(manager.block_size)
+        return int(self.coordinator.scheduler_block_size)
+
     def abort_h2o_retained(self, request_id: str) -> None:
         self.coordinator.abort_h2o_retained(request_id)
 

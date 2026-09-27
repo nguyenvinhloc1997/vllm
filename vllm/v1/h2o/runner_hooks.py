@@ -50,6 +50,18 @@ def maybe_set_h2o_batch_context(
         token_start = int(query_start_loc_np[i])
         token_end = int(query_start_loc_np[i + 1])
         nb = new_ids_map.get(req_id)
+        if is_last or nb is not None:
+            logger.info(
+                "[H2O_DIAG] batch_ctx req=%s prompt=%d computed=%d sched=%d "
+                "is_last=%s new_ids=%s map_keys=%s",
+                req_id,
+                prompt_len,
+                num_computed,
+                n_sched,
+                is_last,
+                None if nb is None else len(nb),
+                list(new_ids_map.keys()),
+            )
         req_ctxs.append(
             H2ORequestContext(
                 request_id=req_id,

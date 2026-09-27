@@ -1479,18 +1479,47 @@ class Scheduler(SchedulerInterface):
             )
             request.h2o_pending_resize = crossed_prompt
             if crossed_prompt:
-                from vllm.v1.h2o.ownership import num_keep_tokens
+                from vllm.logger import init_logger
+                from vllm.v1.h2o.ownership import (
+                    H2O_KERNEL_BLOCK_SIZE,
+                    expand_manager_blocks_to_kernel,
+                    num_keep_tokens,
+                )
 
                 keep_n = num_keep_tokens(
                     request.num_prompt_tokens, float(envs.VLLM_H2O_RATIO)
                 )
-                new_ids = self.kv_cache_manager.allocate_h2o_retained(req_id, keep_n)
+                manager_ids = self.kv_cache_manager.allocate_h2o_retained(
+                    req_id, keep_n
+                )
+                # Hybrid FA pages (e.g. 1536) expand to KVarN tiles (128) for pack.
+                manager_bs = self.kv_cache_manager.get_h2o_fa_block_size()
+                if manager_bs > H2O_KERNEL_BLOCK_SIZE:
+                    kernel_ids = expand_manager_blocks_to_kernel(
+                        manager_ids,
+                        manager_block_size=manager_bs,
+                        kernel_block_size=H2O_KERNEL_BLOCK_SIZE,
+                        num_keep_tokens=keep_n,
+                    )
+                else:
+                    kernel_ids = list(manager_ids)
                 scheduler_output.h2o_resize_req_ids.append(req_id)
-                scheduler_output.h2o_new_block_ids[req_id] = new_ids
-                if new_ids:
+                scheduler_output.h2o_new_block_ids[req_id] = kernel_ids
+                init_logger(__name__).info(
+                    "[H2O_DIAG] schedule_cross req=%s prompt=%d keep=%d "
+                    "manager_bs=%d pages=%d kernel_tiles=%d computed=%d",
+                    req_id,
+                    request.num_prompt_tokens,
+                    keep_n,
+                    manager_bs,
+                    len(manager_ids),
+                    len(kernel_ids),
+                    request.num_computed_tokens,
+                )
+                if manager_ids:
                     if scheduler_output.new_block_ids_to_zero is None:
                         scheduler_output.new_block_ids_to_zero = []
-                    scheduler_output.new_block_ids_to_zero.extend(new_ids)
+                    scheduler_output.new_block_ids_to_zero.extend(manager_ids)
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
