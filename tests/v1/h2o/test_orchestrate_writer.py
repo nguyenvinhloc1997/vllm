@@ -63,10 +63,11 @@ def test_end_of_prefill_invokes_writer_and_sets_runtime(monkeypatch):
                     is_last_prefill_chunk=True,
                     token_start=0,
                     token_end=t,
-                    new_block_ids=list(range(64)),
+                    new_block_ids={0: list(range(64))},
                 )
             ],
             positions=torch.arange(t),
+            layer_to_group={"layers.3": 0},
         )
     )
     w = FakeWriter()
@@ -114,10 +115,11 @@ def test_chunked_prefill_stashes_windows_and_gathers_only_at_end(monkeypatch):
                         is_last_prefill_chunk=end == prompt_len,
                         token_start=0,
                         token_end=chunk,
-                        new_block_ids=list(range(15)),
+                        new_block_ids={0: list(range(15))},
                     )
                 ],
                 positions=torch.arange(start, end),
+                layer_to_group={"layers.3": 0},
             )
         )
         run_h2o_after_attention(

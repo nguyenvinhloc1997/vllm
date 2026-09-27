@@ -4187,7 +4187,7 @@ class GPUModelRunner(
         num_reqs: int,
         positions: torch.Tensor,
         num_scheduled_tokens_np: np.ndarray,
-        h2o_new_block_ids: dict[str, list[int]] | None = None,
+        h2o_new_block_ids: dict[str, dict[int, list[int]]] | None = None,
     ) -> None:
         """Publish end-of-prefill gates for H2O compress (flag-gated)."""
         from vllm.v1.h2o.runner_hooks import maybe_set_h2o_batch_context
@@ -4200,6 +4200,7 @@ class GPUModelRunner(
             query_start_loc_np=self.query_start_loc.np[: num_reqs + 1],
             positions=positions,
             h2o_new_block_ids=h2o_new_block_ids,
+            kv_cache_config=self.kv_cache_config,
         )
 
     def _maybe_remap_h2o_decode_slots(
@@ -4239,18 +4240,22 @@ class GPUModelRunner(
         from vllm.logger import init_logger
 
         init_logger(__name__).info(
-            "[H2O_DIAG] v1_remap n=%d first=(tok=%s slot=%s)",
+            "[H2O_DIAG] v1_remap n=%d first=(tok=%s slots=%s)",
             len(remaps),
             remaps[0][0],
             remaps[0][1],
         )
-        for tok_idx, write_slot in remaps:
-            for bt in block_tables:
+        for tok_idx, slots in remaps:
+            # Each compress-FA group has its own retained blocks → own slot.
+            # Every scheduled token (greedy or DFlash drafts) → circular
+            # recent head. Drafts share one slot until post-commit;
+            # do not widen DFlash num_query_per_req.
+            for g_idx, write_slot in slots.items():
+                if g_idx >= len(block_tables):
+                    continue
+                bt = block_tables[g_idx]
                 if bt.slot_mapping_mode != SlotMappingMode.TOKEN_TO_KV_SLOT:
                     continue
-                # Every scheduled token (greedy or DFlash drafts) → circular
-                # recent head. Drafts share one slot until post-commit;
-                # do not widen DFlash num_query_per_req.
                 bt.slot_mapping.np[tok_idx] = write_slot
         for bt in block_tables:
             if bt.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT:

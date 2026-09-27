@@ -132,7 +132,7 @@ def test_iter_h2o_decode_slot_remaps_covers_full_query_span(monkeypatch):
         )
     )
     assert [t for t, _ in remaps] == list(range(10, 18))
-    assert all(slot == expected for _, slot in remaps)
+    assert all(slots == {0: expected} for _, slots in remaps)
     clear_h2o_runtime(req_id)
 
 

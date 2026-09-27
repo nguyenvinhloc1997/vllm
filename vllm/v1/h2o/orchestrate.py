@@ -181,8 +181,12 @@ def run_h2o_after_attention(
 
         need_blocks = (len(pos_out) + block_size - 1) // block_size
         # KVarN-native: pack into pre-allocated retained blocks from the
-        # scheduler (fresh short table). Fail closed if missing/short.
-        block_ids = list(req.new_block_ids or [])
+        # scheduler (fresh short table), from this layer's own KV cache group:
+        # groups overlay one buffer, so sharing ids across groups would make
+        # paired layers overwrite each other. Fail closed if missing/short.
+        # An unmapped layer gets -1 (never a group id) → no ids → fail closed.
+        group_id = ctx.layer_to_group.get(layer_name, -1)
+        block_ids = list((req.new_block_ids or {}).get(group_id, []))
         if len(block_ids) < need_blocks:
             ctx.failed_pack_request_ids.add(req.request_id)
             drop_prefill_q(req.request_id, layer_name=layer_name)
@@ -204,6 +208,7 @@ def run_h2o_after_attention(
             state=state,
             layout=layout,
             prompt_len=req.prompt_len,
+            group_id=group_id,
         )
         if req.request_id not in ctx.failed_pack_request_ids:
             ctx.packed_request_ids.add(req.request_id)

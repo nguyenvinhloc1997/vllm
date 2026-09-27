@@ -129,7 +129,7 @@ def test_orchestrate_skips_protect_layer(monkeypatch):
                     is_last_prefill_chunk=True,
                     token_start=0,
                     token_end=t,
-                    new_block_ids=list(range(64)),
+                    new_block_ids={0: list(range(64))},
                 )
             ],
             positions=torch.arange(t),

@@ -19,6 +19,8 @@ from vllm.v1.h2o.slots import SlotLayout
 class H2OLayerRuntime:
     state: H2OState
     layout: SlotLayout
+    # KV cache group whose retained blocks back ``layout``.
+    group_id: int = 0
     # Circular-recent slot KV captured before remapped FA decode overwrite.
     stashed_aged_key: torch.Tensor | None = None  # [H_kv, D]
     stashed_aged_value: torch.Tensor | None = None
@@ -63,9 +65,12 @@ def set_h2o_layer_runtime(
     state: H2OState,
     layout: SlotLayout,
     prompt_len: int,
+    group_id: int = 0,
 ) -> H2ORequestRuntime:
     rt = get_or_create_h2o_request_runtime(request_id, prompt_len=prompt_len)
-    rt.layers[layer_name] = H2OLayerRuntime(state=state, layout=layout)
+    rt.layers[layer_name] = H2OLayerRuntime(
+        state=state, layout=layout, group_id=group_id
+    )
     rt.prefill_q.pop(layer_name, None)
     return rt
 

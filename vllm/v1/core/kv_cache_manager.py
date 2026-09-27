@@ -596,7 +596,9 @@ class KVCacheManager:
         """Swap FA block tables to H2O retained blocks after pack."""
         self.coordinator.resize_h2o_full_attention(request_id, num_keep_tokens)
 
-    def allocate_h2o_retained(self, request_id: str, num_keep_tokens: int) -> list[int]:
+    def allocate_h2o_retained(
+        self, request_id: str, num_keep_tokens: int
+    ) -> dict[int, list[int]]:
         return self.coordinator.allocate_h2o_retained(request_id, num_keep_tokens)
 
     def get_h2o_fa_block_size(self) -> int:

@@ -1501,37 +1501,39 @@ class Scheduler(SchedulerInterface):
                 keep_n = num_keep_tokens(
                     request.num_prompt_tokens, float(envs.VLLM_H2O_RATIO)
                 )
-                manager_ids = self.kv_cache_manager.allocate_h2o_retained(
+                manager_ids_by_group = self.kv_cache_manager.allocate_h2o_retained(
                     req_id, keep_n
                 )
                 # Hybrid FA pages (e.g. 1536) expand to KVarN tiles (128) for pack.
                 manager_bs = self.kv_cache_manager.get_h2o_fa_block_size()
-                if manager_bs > H2O_KERNEL_BLOCK_SIZE:
-                    kernel_ids = expand_manager_blocks_to_kernel(
-                        manager_ids,
-                        manager_block_size=manager_bs,
-                        kernel_block_size=H2O_KERNEL_BLOCK_SIZE,
-                        num_keep_tokens=keep_n,
-                    )
-                else:
-                    kernel_ids = list(manager_ids)
+                kernel_ids_by_group: dict[int, list[int]] = {}
+                for gid, manager_ids in manager_ids_by_group.items():
+                    if manager_bs > H2O_KERNEL_BLOCK_SIZE:
+                        kernel_ids_by_group[gid] = expand_manager_blocks_to_kernel(
+                            manager_ids,
+                            manager_block_size=manager_bs,
+                            kernel_block_size=H2O_KERNEL_BLOCK_SIZE,
+                            num_keep_tokens=keep_n,
+                        )
+                    else:
+                        kernel_ids_by_group[gid] = list(manager_ids)
+                    if manager_ids:
+                        if scheduler_output.new_block_ids_to_zero is None:
+                            scheduler_output.new_block_ids_to_zero = []
+                        scheduler_output.new_block_ids_to_zero.extend(manager_ids)
                 scheduler_output.h2o_resize_req_ids.append(req_id)
-                scheduler_output.h2o_new_block_ids[req_id] = kernel_ids
+                scheduler_output.h2o_new_block_ids[req_id] = kernel_ids_by_group
                 init_logger(__name__).info(
                     "[H2O_DIAG] schedule_cross req=%s prompt=%d keep=%d "
-                    "manager_bs=%d pages=%d kernel_tiles=%d computed=%d",
+                    "manager_bs=%d pages=%s kernel_tiles=%s computed=%d",
                     req_id,
                     request.num_prompt_tokens,
                     keep_n,
                     manager_bs,
-                    len(manager_ids),
-                    len(kernel_ids),
+                    {g: len(b) for g, b in manager_ids_by_group.items()},
+                    {g: len(b) for g, b in kernel_ids_by_group.items()},
                     request.num_computed_tokens,
                 )
-                if manager_ids:
-                    if scheduler_output.new_block_ids_to_zero is None:
-                        scheduler_output.new_block_ids_to_zero = []
-                    scheduler_output.new_block_ids_to_zero.extend(manager_ids)
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )

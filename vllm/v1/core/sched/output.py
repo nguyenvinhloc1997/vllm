@@ -308,7 +308,8 @@ class SchedulerOutput:
     # outputs after the flag is set on the request).
     h2o_resize_req_ids: list[str] = field(default_factory=list)
     # Pre-allocated retained FA physical block ids for those requests.
-    h2o_new_block_ids: dict[str, list[int]] = field(default_factory=dict)
+    # req_id -> {kv_cache_group_id: retained kernel block ids}.
+    h2o_new_block_ids: dict[str, dict[int, list[int]]] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

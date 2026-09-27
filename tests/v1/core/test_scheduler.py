@@ -63,7 +63,7 @@ def test_h2o_resize_requires_completed_pack(
     scheduler.add_request(request)
     swap = Mock()
     abort = Mock()
-    alloc = Mock(return_value=[7, 8])
+    alloc = Mock(return_value={0: [7, 8]})
     monkeypatch.setattr(scheduler.kv_cache_manager, "swap_h2o_full_attention", swap)
     monkeypatch.setattr(scheduler.kv_cache_manager, "abort_h2o_retained", abort)
     monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_h2o_retained", alloc)
@@ -71,7 +71,7 @@ def test_h2o_resize_requires_completed_pack(
     scheduler_output = scheduler.schedule()
     assert request.h2o_pending_resize
     assert request.request_id in scheduler_output.h2o_resize_req_ids
-    assert scheduler_output.h2o_new_block_ids.get(request.request_id) == [7, 8]
+    assert scheduler_output.h2o_new_block_ids.get(request.request_id) == {0: [7, 8]}
     assert alloc.call_count == 1
     model_output = ModelRunnerOutput(
         req_ids=[request.request_id],
@@ -101,7 +101,7 @@ def test_h2o_resize_ignores_earlier_inflight_step(monkeypatch: pytest.MonkeyPatc
     scheduler.add_request(request)
     swap = Mock()
     abort = Mock()
-    alloc = Mock(return_value=[1, 2])
+    alloc = Mock(return_value={0: [1, 2]})
     monkeypatch.setattr(scheduler.kv_cache_manager, "swap_h2o_full_attention", swap)
     monkeypatch.setattr(scheduler.kv_cache_manager, "abort_h2o_retained", abort)
     monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_h2o_retained", alloc)
@@ -157,7 +157,7 @@ def test_h2o_swap_forces_worker_block_table_replace(
     short_blocks = ([101, 102],)
     swap = Mock()
     abort = Mock()
-    alloc = Mock(return_value=[7, 8])
+    alloc = Mock(return_value={0: [7, 8]})
     monkeypatch.setattr(scheduler.kv_cache_manager, "swap_h2o_full_attention", swap)
     monkeypatch.setattr(scheduler.kv_cache_manager, "abort_h2o_retained", abort)
     monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_h2o_retained", alloc)
@@ -195,7 +195,9 @@ def test_h2o_async_barrier_holds_decode_until_swap(
     (request,) = create_requests(num_requests=1, num_tokens=600)
     scheduler.add_request(request)
     monkeypatch.setattr(
-        scheduler.kv_cache_manager, "allocate_h2o_retained", Mock(return_value=[7, 8])
+        scheduler.kv_cache_manager,
+        "allocate_h2o_retained",
+        Mock(return_value={0: [7, 8]}),
     )
     monkeypatch.setattr(scheduler.kv_cache_manager, "swap_h2o_full_attention", Mock())
     monkeypatch.setattr(scheduler.kv_cache_manager, "abort_h2o_retained", Mock())

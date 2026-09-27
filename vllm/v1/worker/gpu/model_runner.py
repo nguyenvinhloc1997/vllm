@@ -1777,6 +1777,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 query_start_loc_np=input_batch.query_start_loc_np,
                 positions=input_batch.positions,
                 h2o_new_block_ids=getattr(scheduler_output, "h2o_new_block_ids", None),
+                kv_cache_config=self.kv_cache_config,
             )
         try:
             # Run model.

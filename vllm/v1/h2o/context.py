@@ -22,8 +22,9 @@ class H2ORequestContext:
     # Token slice into the batch Q/K/V / positions tensors.
     token_start: int
     token_end: int
-    # Pre-allocated retained FA block ids for KVarN-native pack (optional).
-    new_block_ids: list[int] | None = None
+    # Pre-allocated retained FA block ids for KVarN-native pack, keyed by KV
+    # cache group id. Groups overlay one buffer, so each needs its own ids.
+    new_block_ids: dict[int, list[int]] | None = None
 
 
 @dataclass
@@ -32,6 +33,8 @@ class H2OBatchContext:
     positions: torch.Tensor | None = None  # [num_tokens] absolute RoPE positions
     packed_request_ids: set[str] = field(default_factory=set)
     failed_pack_request_ids: set[str] = field(default_factory=set)
+    # Attention layer name -> KV cache group id (selects new_block_ids).
+    layer_to_group: dict[str, int] = field(default_factory=dict)
 
 
 _BATCH_CTX: H2OBatchContext | None = None

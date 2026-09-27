@@ -26,7 +26,8 @@ def maybe_set_h2o_batch_context(
     num_scheduled_tokens: Sequence[int] | np.ndarray,
     query_start_loc_np: np.ndarray,
     positions: torch.Tensor,
-    h2o_new_block_ids: Mapping[str, Sequence[int]] | None = None,
+    h2o_new_block_ids: Mapping[str, Mapping[int, Sequence[int]]] | None = None,
+    kv_cache_config: Any = None,
 ) -> None:
     """Publish end-of-prefill gates for H2O compress (flag-gated)."""
     if not envs.VLLM_H2O:
@@ -59,7 +60,7 @@ def maybe_set_h2o_batch_context(
                 num_computed,
                 n_sched,
                 is_last,
-                None if nb is None else len(nb),
+                None if nb is None else {g: len(b) for g, b in nb.items()},
                 list(new_ids_map.keys()),
             )
         req_ctxs.append(
@@ -70,11 +71,28 @@ def maybe_set_h2o_batch_context(
                 is_last_prefill_chunk=is_last,
                 token_start=token_start,
                 token_end=token_end,
-                new_block_ids=list(nb) if nb is not None else None,
+                new_block_ids=(
+                    {int(g): list(b) for g, b in nb.items()} if nb is not None else None
+                ),
             )
         )
     pos_t = positions[0] if positions.ndim > 1 else positions
-    set_h2o_batch_context(H2OBatchContext(requests=req_ctxs, positions=pos_t.detach()))
+    set_h2o_batch_context(
+        H2OBatchContext(
+            requests=req_ctxs,
+            positions=pos_t.detach(),
+            layer_to_group=_layer_to_group(kv_cache_config),
+        )
+    )
+
+
+def _layer_to_group(kv_cache_config: Any) -> dict[str, int]:
+    groups = getattr(kv_cache_config, "kv_cache_groups", None) or []
+    return {
+        name: gid
+        for gid, group in enumerate(groups)
+        for name in getattr(group, "layer_names", ())
+    }
 
 
 def maybe_clear_h2o_batch_context() -> list[str]:
@@ -142,8 +160,12 @@ def _stash_aged_slots_for_request(
     *,
     req_id: str,
     forward_ctx: Mapping[str, Any],
-) -> int | None:
-    """Stash aged-recent KV; return circular write slot from the first layer.
+) -> dict[int, int] | None:
+    """Stash aged-recent KV; return circular write slot per KV cache group.
+
+    Each compress-FA group owns its retained blocks, so the write slot is taken
+    from the first layer of each group (layers in a group share one
+    slot_mapping row).
 
     FA pages get an aged-slot stash for promote-copy. KVarN (and other non-FA)
     layouts still return the circular write slot for ``slot_mapping`` remap but
@@ -161,9 +183,9 @@ def _stash_aged_slots_for_request(
     rt = get_h2o_runtime(req_id)
     if rt is None or not rt.layers:
         return None
-    layer_rt0 = next(iter(rt.layers.values()))
-    write_slot = next_decode_write_slot(layer_rt0)
+    slots: dict[int, int] = {}
     for layer_name, layer_rt in rt.layers.items():
+        slot = slots.setdefault(layer_rt.group_id, next_decode_write_slot(layer_rt))
         attn = forward_ctx.get(layer_name)
         if attn is None or not hasattr(attn, "kv_cache"):
             continue
@@ -174,17 +196,14 @@ def _stash_aged_slots_for_request(
             continue
         head_size = head_size_from_fa_kv_cache(kv)
         key_cache, value_cache = split_fa_kv_cache(kv, head_size)
-        aged_slot = (
-            write_slot if layer_rt is layer_rt0 else next_decode_write_slot(layer_rt)
-        )
         aged_k, aged_v = read_slot_kv(
             key_cache,
             value_cache,
-            aged_slot,
+            slot,
             block_size=layer_rt.layout.block_size,
         )
         stash_aged_slot_kv(layer_rt, key=aged_k, value=aged_v)
-    return write_slot
+    return slots or None
 
 
 def iter_h2o_decode_slot_remaps(
@@ -194,7 +213,7 @@ def iter_h2o_decode_slot_remaps(
     query_start_loc_np: np.ndarray,
     forward_ctx: Mapping[str, Any],
 ):
-    """Yield ``(tok_idx, write_slot)`` for every decode token needing remap.
+    """Yield ``(tok_idx, {group_id: write_slot})`` for decode tokens needing remap.
 
     Prefill rows are skipped. After Ownership-A the absolute
     ``TOKEN_TO_KV_SLOT`` indices walk past the truncated block table, so
@@ -213,17 +232,15 @@ def iter_h2o_decode_slot_remaps(
         num_computed = int(num_computed_tokens[i])
         if num_computed < rt.prompt_len:
             continue
-        write_slot = _stash_aged_slots_for_request(
-            req_id=req_id, forward_ctx=forward_ctx
-        )
-        if write_slot is None:
+        slots = _stash_aged_slots_for_request(req_id=req_id, forward_ctx=forward_ctx)
+        if slots is None:
             continue
         tok0 = int(query_start_loc_np[i])
         tok1 = int(query_start_loc_np[i + 1])
         if tok1 <= tok0:
             continue
         for tok_idx in range(tok0, tok1):
-            yield tok_idx, write_slot
+            yield tok_idx, slots
 
 
 def maybe_remap_h2o_decode_slots_gpu(
@@ -237,13 +254,11 @@ def maybe_remap_h2o_decode_slots_gpu(
 ) -> None:
     """Patch V2 GPU ``slot_mappings`` for H2O circular decode writes.
 
-    Only remaps KV cache groups whose layer names appear in the request's
-    H2O runtime (full-attention), leaving Mamba/GDN groups untouched.
+    Only remaps the KV cache groups that own the request's H2O layers, each
+    with its own write slot, leaving Mamba/GDN groups untouched.
     """
     if not envs.VLLM_H2O:
         return
-    from vllm.v1.h2o.runtime import get_h2o_runtime
-
     remaps = list(
         iter_h2o_decode_slot_remaps(
             req_ids=req_ids,
@@ -256,36 +271,16 @@ def maybe_remap_h2o_decode_slots_gpu(
         return
 
     logger.info(
-        "[H2O_DIAG] remap n=%d first=(tok=%s slot=%s) last=(tok=%s slot=%s)",
+        "[H2O_DIAG] remap n=%d first=(tok=%s slots=%s)",
         len(remaps),
         remaps[0][0],
         remaps[0][1],
-        remaps[-1][0],
-        remaps[-1][1],
     )
-
-    groups = getattr(kv_cache_config, "kv_cache_groups", None) or []
-    # Groups are model-static; any H2O runtime's layer set selects FA groups.
-    h2o_layers: set[str] | None = None
-    for req_id in req_ids:
-        rt = get_h2o_runtime(req_id)
-        if rt is not None and rt.layers:
-            h2o_layers = set(rt.layers.keys())
-            break
-    fa_group_indices = []
-    for g_idx, group in enumerate(groups):
-        if g_idx >= slot_mappings.shape[0]:
-            break
-        if h2o_layers is not None:
-            layer_names = getattr(group, "layer_names", ())
-            if not any(name in h2o_layers for name in layer_names):
-                continue
-        fa_group_indices.append(g_idx)
-    if not fa_group_indices:
-        return
-    for tok_idx, write_slot in remaps:
-        for g_idx in fa_group_indices:
-            slot_mappings[g_idx, tok_idx] = write_slot
+    num_groups = slot_mappings.shape[0]
+    for tok_idx, slots in remaps:
+        for g_idx, write_slot in slots.items():
+            if g_idx < num_groups:
+                slot_mappings[g_idx, tok_idx] = write_slot
 
 
 def h2o_decode_after_commit(

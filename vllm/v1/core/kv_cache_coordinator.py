@@ -408,59 +408,41 @@ class KVCacheCoordinator(ABC):
         ]
 
     def resize_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
-        """Swap compress-FA groups to the shared retained block list."""
-        fa_managers = self._compress_fa_managers()
-        if not fa_managers:
-            return
-        # Owner swaps first (consumes pending, frees old).
-        fa_managers[0].swap_after_h2o_compress(request_id, num_keep_tokens)
-        shared = list(fa_managers[0].req_to_blocks.get(request_id, []))
-        for manager in fa_managers[1:]:
-            # Drop follower pending without freeing (owner owns alloc ref).
-            manager.h2o_pending_blocks.pop(request_id, None)
-            old = manager.req_to_blocks.get(request_id, [])
-            manager.req_to_blocks[request_id] = list(shared)
-            # Each manager that holds the shared blocks needs its own ref so
-            # coordinator.free (per-manager) does not drive ref_cnt negative.
-            for block in shared:
-                block.ref_cnt += 1
-            if old:
-                manager.block_pool.free_blocks(reversed(old))
-            if request_id in manager.num_cached_block:
-                manager.num_cached_block[request_id] = min(
-                    manager.num_cached_block[request_id], len(shared)
-                )
-            manager.h2o_num_tokens[request_id] = num_keep_tokens
+        """Swap each compress-FA group to its own retained blocks."""
+        for manager in self._compress_fa_managers():
+            manager.swap_after_h2o_compress(request_id, num_keep_tokens)
 
-    def allocate_h2o_retained(self, request_id: str, num_keep_tokens: int) -> list[int]:
-        """Pre-allocate retained blocks once; share across compress-FA managers."""
+    def allocate_h2o_retained(
+        self, request_id: str, num_keep_tokens: int
+    ) -> dict[int, list[int]]:
+        """Pre-allocate retained blocks per compress-FA group.
+
+        KV cache groups overlay one backing buffer, so block ``b`` of FA group
+        0 and FA group 1 are the same bytes. Each group needs its own blocks or
+        paired layers overwrite each other's packed KV. Protect FA managers are
+        excluded. Returns ``{kv_cache_group_id: manager block ids}``.
+        """
         from vllm.logger import init_logger
 
-        fa_managers = self._compress_fa_managers()
-        if not fa_managers:
-            return []
-        # One get_new_blocks for all compress FA groups; others reuse the same
-        # physicals. Protect FA managers are excluded.
-        ids = fa_managers[0].allocate_h2o_retained(request_id, num_keep_tokens)
-        shared = fa_managers[0].h2o_pending_blocks.get(request_id, [])
-        for manager in fa_managers[1:]:
-            manager.h2o_pending_blocks[request_id] = list(shared)
+        ids: dict[int, list[int]] = {}
+        try:
+            for manager in self._compress_fa_managers():
+                ids[manager.kv_cache_group_id] = manager.allocate_h2o_retained(
+                    request_id, num_keep_tokens
+                )
+        except ValueError:
+            self.abort_h2o_retained(request_id)
+            raise
         init_logger(__name__).info(
-            "[H2O_DIAG] alloc_share n_fa=%d pages=%d pool_ids=%s",
-            len(fa_managers),
+            "[H2O_DIAG] alloc_per_group n_fa=%d pages=%s",
             len(ids),
-            [id(m.block_pool) for m in fa_managers],
+            {gid: len(b) for gid, b in ids.items()},
         )
         return ids
 
     def abort_h2o_retained(self, request_id: str) -> None:
-        fa_managers = self._compress_fa_managers()
-        if not fa_managers:
-            return
-        # Shared pending — free once via the owner manager.
-        fa_managers[0].abort_h2o_retained(request_id)
-        for manager in fa_managers[1:]:
-            manager.h2o_pending_blocks.pop(request_id, None)
+        for manager in self._compress_fa_managers():
+            manager.abort_h2o_retained(request_id)
 
     def swap_h2o_full_attention(self, request_id: str, num_keep_tokens: int) -> None:
         self.resize_h2o_full_attention(request_id, num_keep_tokens)
