@@ -645,6 +645,15 @@ class Attention(nn.Module, AttentionLayerBase):
                 page_size_padded=shared_page,
             )
         else:
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            try:
+                layer_idx = extract_layer_index(self.layer_name)
+            except (AssertionError, ValueError, IndexError):
+                layer_idx = None
+            h2o_protect = (
+                layer_idx is not None and layer_idx in envs.VLLM_H2O_PROTECT_FA_LAYERS
+            )
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
@@ -652,6 +661,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                h2o_protect=h2o_protect,
             )
 
 

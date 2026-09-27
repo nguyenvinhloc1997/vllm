@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_NGM_SCALE: float = 0.1
     VLLM_H2O: bool = False
     VLLM_H2O_RATIO: float = 0.4
+    VLLM_H2O_PROTECT_FA_LAYERS: frozenset[int] = frozenset()
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
@@ -1517,6 +1518,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NGM_SCALE": lambda: float(os.environ.get("VLLM_NGM_SCALE", "0.1")),
     "VLLM_H2O": lambda: os.environ.get("VLLM_H2O", "0") == "1",
     "VLLM_H2O_RATIO": lambda: float(os.environ.get("VLLM_H2O_RATIO", "0.4")),
+    "VLLM_H2O_PROTECT_FA_LAYERS": lambda: frozenset(
+        int(x)
+        for x in os.environ.get("VLLM_H2O_PROTECT_FA_LAYERS", "").split(",")
+        if x.strip()
+    ),
     # The activation dtype config for humming kernel
     "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
         os.environ.get("VLLM_HUMMING_INPUT_QUANT_CONFIG", None)
@@ -2351,6 +2357,7 @@ def compile_factors() -> dict[str, object]:
         # H2O KV eviction policy; runtime-only, not compile graph shape.
         "VLLM_H2O",
         "VLLM_H2O_RATIO",
+        "VLLM_H2O_PROTECT_FA_LAYERS",
     }
 
     from vllm.config.utils import normalize_value
