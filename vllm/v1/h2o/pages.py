@@ -15,14 +15,32 @@ from vllm.v1.h2o.slots import SlotLayout
 def is_fa_paged_kv_cache(kv_cache: torch.Tensor) -> bool:
     """True for FlashAttention paged layout ``[num_blocks, H_kv, block_size, 2*D]``.
 
-    KVarN packed tiles are typically ``[num_blocks, H_kv, tile_bytes]`` (3-D).
+    KVarN packed tiles are typically ``[num_blocks, H_kv, tile_bytes]`` (3-D)
+    or a vLLM reinterpretation ``[num_blocks, group, H_kv, tile_bytes]`` (4-D).
+    The 4-D form has an even last dim (e.g. 140) and must not be treated as FA
+    — FA puts ``H_kv`` before ``block_size``; KVarN puts ``group`` first.
+
+    Treating KVarN as FA sends post-commit scoring into
+    ``accumulate_attention_mass`` with mismatched ``D`` and kills the engine
+    (Task 15 compress-eligible ``AssertionError`` / HTTP 500).
     """
-    return (
-        isinstance(kv_cache, torch.Tensor)
-        and kv_cache.ndim == 4
-        and kv_cache.shape[-1] >= 2
-        and kv_cache.shape[-1] % 2 == 0
-    )
+    if not isinstance(kv_cache, torch.Tensor) or kv_cache.ndim != 4:
+        return False
+    last = int(kv_cache.shape[-1])
+    if last < 2 or last % 2 != 0:
+        return False
+    # Non-floating caches are packed tiles (KVarN), never FA bf16/fp16 pages.
+    if not kv_cache.is_floating_point():
+        return False
+    head_size = last // 2
+    # FA ``2*D`` uses a modest power-of-two head size; KVarN ``tile_bytes/2``
+    # is not (e.g. 70 for tile=140, or thousands for full tiles).
+    if head_size < 8 or head_size > 512 or (head_size & (head_size - 1)) != 0:
+        return False
+    # FA: [B, H_kv, block_size, 2D] — heads (small) before block_size.
+    # KVarN reinterpret: [B, group, H_kv, tile] — group (>=64) before heads.
+    dim1, dim2 = int(kv_cache.shape[1]), int(kv_cache.shape[2])
+    return not (dim1 >= 64 and dim1 > dim2)
 
 
 def split_fa_kv_cache(

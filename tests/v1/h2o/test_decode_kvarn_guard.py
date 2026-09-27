@@ -143,3 +143,32 @@ def test_is_fa_paged_kv_cache_detects_layouts():
     assert is_fa_paged_kv_cache(fa)
     kvarn = torch.zeros(8, 2, 256, dtype=torch.uint8)
     assert not is_fa_paged_kv_cache(kvarn)
+    # Live KVarN often reinterprets as 4-D [B, group, H_kv, tile_bytes]
+    # (tile_bytes even, e.g. 140). Must NOT be treated as FA paged.
+    kvarn_4d = torch.zeros(8, 128, 4, 140, dtype=torch.uint8)
+    assert not is_fa_paged_kv_cache(kvarn_4d)
+    kvarn_4d_fp = torch.zeros(8, 128, 4, 140, dtype=torch.float16)
+    assert not is_fa_paged_kv_cache(kvarn_4d_fp)
+
+
+def test_decode_after_commit_skips_fa_path_on_kvarn_4d(monkeypatch):
+    """4-D KVarN reinterpret must stay on policy-only post-commit (no FA score)."""
+    monkeypatch.setattr(envs, "VLLM_H2O", True)
+    req_id = "r-kvarn-4d"
+    layer_name = "layers.3.self_attn.attn"
+    _seed_runtime(req_id, layer_name, prompt_len=40)
+    # [num_blocks, group, H_kv, tile_bytes] — even last dim, not FA 2*D.
+    kvarn_4d = torch.zeros(4, 128, 2, 140, dtype=torch.float16)
+    forward_ctx = {layer_name: SimpleNamespace(kv_cache=kvarn_4d)}
+
+    import vllm.v1.h2o.pages as pages
+
+    monkeypatch.setattr(
+        pages,
+        "split_fa_kv_cache",
+        MagicMock(side_effect=AssertionError("must not FA-split KVarN 4-D")),
+    )
+    h2o_decode_after_commit({req_id: [40]}, forward_ctx)
+    layer_rt = get_layer_rt(req_id, layer_name)
+    assert 40 in (set(layer_rt.state.heavy) | set(layer_rt.state.recent))
+    clear_h2o_runtime(req_id)
