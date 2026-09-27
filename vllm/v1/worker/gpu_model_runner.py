@@ -4622,7 +4622,7 @@ class GPUModelRunner(
         finally:
             from vllm.v1.h2o.runner_hooks import maybe_clear_h2o_batch_context
 
-            maybe_clear_h2o_batch_context()
+            self._h2o_packed_request_ids = maybe_clear_h2o_batch_context()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4937,6 +4937,7 @@ class GPUModelRunner(
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
+                h2o_packed_request_ids=getattr(self, "_h2o_packed_request_ids", []),
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,

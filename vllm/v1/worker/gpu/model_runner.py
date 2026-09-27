@@ -1811,7 +1811,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         # Eager (NONE): call the raw model directly.
                         model_output = self.model(**model_inputs)
         finally:
-            maybe_clear_h2o_batch_context()
+            self._h2o_packed_request_ids = maybe_clear_h2o_batch_context()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1925,6 +1925,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): req_id_to_index is unused in this model runner.
             # Only for compatibility with the existing model runner and scheduler.
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
+            h2o_packed_request_ids=getattr(self, "_h2o_packed_request_ids", []),
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )

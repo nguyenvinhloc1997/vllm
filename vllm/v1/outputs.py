@@ -338,6 +338,9 @@ class ModelRunnerOutput:
     # req_id -> index
     req_id_to_index: dict[str, int]
 
+    # Requests whose end-of-prefill H2O KV pack completed on the worker.
+    h2o_packed_request_ids: list[str] = field(default_factory=list)
+
     # num_reqs x num_generated_tokens
     # num_generated_tokens is the number of tokens
     # generated in the current step. It can be different for

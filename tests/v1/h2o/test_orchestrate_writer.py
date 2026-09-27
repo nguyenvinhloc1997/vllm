@@ -13,9 +13,11 @@ from vllm.v1.h2o.context import (
     H2OBatchContext,
     H2ORequestContext,
     clear_h2o_batch_context,
+    get_h2o_batch_context,
     set_h2o_batch_context,
 )
 from vllm.v1.h2o.orchestrate import run_h2o_after_attention
+from vllm.v1.h2o.runner_hooks import maybe_clear_h2o_batch_context
 from vllm.v1.h2o.runtime import clear_h2o_runtime, get_h2o_runtime
 
 pytestmark = pytest.mark.cpu_test
@@ -80,6 +82,7 @@ def test_end_of_prefill_invokes_writer_and_sets_runtime(monkeypatch):
     )
     assert len(gather.calls) == 1
     assert w.calls, "writer must run at end of prefill"
+    assert get_h2o_batch_context().packed_request_ids == {"r0"}
     rt = get_h2o_runtime("r0")
     assert rt is not None and "layers.3" in rt.layers
     clear_h2o_batch_context()
@@ -177,7 +180,8 @@ def test_partial_prefix_hit_drops_incomplete_stash_without_gather(monkeypatch):
     assert writer.calls == []
     rt = get_h2o_runtime(request_id)
     assert rt is not None and rt.prefill_q == {}
-    clear_h2o_batch_context()
+    assert get_h2o_batch_context().packed_request_ids == set()
+    assert maybe_clear_h2o_batch_context() == []
     clear_h2o_runtime(request_id)
 
 

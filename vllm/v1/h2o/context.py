@@ -28,6 +28,8 @@ class H2ORequestContext:
 class H2OBatchContext:
     requests: list[H2ORequestContext] = field(default_factory=list)
     positions: torch.Tensor | None = None  # [num_tokens] absolute RoPE positions
+    packed_request_ids: set[str] = field(default_factory=set)
+    failed_pack_request_ids: set[str] = field(default_factory=set)
 
 
 _BATCH_CTX: H2OBatchContext | None = None

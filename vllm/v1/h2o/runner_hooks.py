@@ -58,12 +58,22 @@ def maybe_set_h2o_batch_context(
     set_h2o_batch_context(H2OBatchContext(requests=req_ctxs, positions=pos_t.detach()))
 
 
-def maybe_clear_h2o_batch_context() -> None:
+def maybe_clear_h2o_batch_context() -> list[str]:
     if not envs.VLLM_H2O:
-        return
-    from vllm.v1.h2o.context import clear_h2o_batch_context
+        return []
+    from vllm.v1.h2o.context import (
+        clear_h2o_batch_context,
+        get_h2o_batch_context,
+    )
 
+    ctx = get_h2o_batch_context()
+    packed_request_ids = (
+        sorted(ctx.packed_request_ids - ctx.failed_pack_request_ids)
+        if ctx is not None
+        else []
+    )
     clear_h2o_batch_context()
+    return packed_request_ids
 
 
 def retained_kv_lens_by_batch_idx(req_ids: Sequence[str]) -> dict[int, int]:

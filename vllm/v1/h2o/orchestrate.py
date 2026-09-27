@@ -94,11 +94,13 @@ def run_h2o_after_attention(
         )
         if recent_len >= req.prompt_len:
             # Compression cannot remove anything from a prompt this short.
+            ctx.failed_pack_request_ids.add(req.request_id)
             drop_prefill_q(req.request_id, layer_name=layer_name)
             continue
 
         all_slots = stash.slots
         if any(slot < 0 for slot in all_slots):
+            ctx.failed_pack_request_ids.add(req.request_id)
             drop_prefill_q(req.request_id, layer_name=layer_name)
             continue
 
@@ -108,6 +110,7 @@ def run_h2o_after_attention(
             | set(range(max(0, req.prompt_len - stash.w), req.prompt_len))
         )
         if q_positions != expected_q_positions:
+            ctx.failed_pack_request_ids.add(req.request_id)
             drop_prefill_q(req.request_id, layer_name=layer_name)
             continue
 
@@ -151,6 +154,7 @@ def run_h2o_after_attention(
                     break
         block_ids = block_ids[:need_blocks]
         if not block_ids:
+            ctx.failed_pack_request_ids.add(req.request_id)
             continue
         writer.write_kept_kv(k_out, v_out, block_ids=block_ids, block_size=block_size)
         layout = build_slot_layout(pos_out, block_ids, block_size)
@@ -161,3 +165,5 @@ def run_h2o_after_attention(
             layout=layout,
             prompt_len=req.prompt_len,
         )
+        if req.request_id not in ctx.failed_pack_request_ids:
+            ctx.packed_request_ids.add(req.request_id)

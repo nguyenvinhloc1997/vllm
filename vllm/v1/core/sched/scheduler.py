@@ -1972,7 +1972,10 @@ class Scheduler(SchedulerInterface):
             # repacks kept KV into the leading pages during that same step.
             # Flag is set in _update_after_schedule only when scheduled tokens
             # cross prompt_len (skips prefix-cache full hits).
-            if request.h2o_pending_resize:
+            if (
+                request.h2o_pending_resize
+                and req_id in model_runner_output.h2o_packed_request_ids
+            ):
                 from vllm.v1.h2o.ownership import num_keep_tokens
 
                 self.kv_cache_manager.resize_h2o_full_attention(
@@ -1981,6 +1984,7 @@ class Scheduler(SchedulerInterface):
                         request.num_prompt_tokens, float(envs.VLLM_H2O_RATIO)
                     ),
                 )
+            if request.h2o_pending_resize:
                 request.h2o_pending_resize = False
 
             # Free encoder inputs only after the step has actually executed.

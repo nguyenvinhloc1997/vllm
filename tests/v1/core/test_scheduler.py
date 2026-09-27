@@ -53,6 +53,32 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("packed", [False, True])
+def test_h2o_resize_requires_completed_pack(
+    monkeypatch: pytest.MonkeyPatch, packed: bool
+):
+    monkeypatch.setattr(envs, "VLLM_H2O", True)
+    scheduler = create_scheduler()
+    (request,) = create_requests(num_requests=1, num_tokens=600)
+    scheduler.add_request(request)
+    resize = Mock()
+    monkeypatch.setattr(scheduler.kv_cache_manager, "resize_h2o_full_attention", resize)
+
+    scheduler_output = scheduler.schedule()
+    assert request.h2o_pending_resize
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[1000]],
+        h2o_packed_request_ids=[request.request_id] if packed else [],
+    )
+
+    scheduler.update_from_output(scheduler_output, model_output)
+
+    assert resize.call_count == int(packed)
+    assert not request.h2o_pending_resize
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [
