@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-def compute_k(prompt_len: int, ratio: float = 0.2) -> int:
+def compute_k(prompt_len: int, ratio: float = 0.4) -> int:
     if prompt_len < 2:
         return 0
     total = int(ratio * prompt_len)

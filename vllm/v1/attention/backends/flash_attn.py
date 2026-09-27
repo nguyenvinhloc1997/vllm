@@ -1285,6 +1285,7 @@ class FlashAttentionImpl(AttentionImpl):
         if key is None or value is None:
             return
         from vllm.v1.h2o.orchestrate import run_h2o_after_attention
+        from vllm.v1.h2o.pages import fa_kv_gather
         from vllm.v1.h2o.writers import fa_kept_kv_writer
 
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
@@ -1296,6 +1297,7 @@ class FlashAttentionImpl(AttentionImpl):
             value=value,
             slot_mapping=slot_mapping,
             block_size=key_cache.shape[1],
+            gather=fa_kv_gather(key_cache, value_cache),
             writer=fa_kept_kv_writer(key_cache, value_cache),
             scale=self.scale,
             sliding_window=self.sliding_window,

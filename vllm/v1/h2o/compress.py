@@ -46,7 +46,7 @@ def compress_prefill_kv(
     k: torch.Tensor,
     v: torch.Tensor,
     positions: list[int],
-    ratio: float = 0.2,
+    ratio: float = 0.4,
     *,
     mass: torch.Tensor | None = None,
     tile_q: int = 64,
