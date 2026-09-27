@@ -580,6 +580,13 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            # H2O Ownership-A: under async scheduling the pack step may still be
+            # in flight. Do not schedule decode until swap + worker BT replace
+            # land — otherwise clamp/remap run against the pre-pack long table.
+            if envs.VLLM_H2O and request.h2o_pending_resize:
+                req_index += 1
+                continue
+
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
@@ -1480,8 +1487,10 @@ class Scheduler(SchedulerInterface):
                 and was_below_prompt
                 and request.num_computed_tokens >= request.num_prompt_tokens
             )
-            request.h2o_pending_resize = crossed_prompt
+            # Sticky until update_from_output swaps. Do not clear on later
+            # schedule() calls — async can schedule before pack returns.
             if crossed_prompt:
+                request.h2o_pending_resize = True
                 from vllm.logger import init_logger
                 from vllm.v1.h2o.ownership import (
                     H2O_KERNEL_BLOCK_SIZE,

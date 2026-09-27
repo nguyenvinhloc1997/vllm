@@ -186,6 +186,50 @@ def test_h2o_swap_forces_worker_block_table_replace(
     assert request.request_id not in scheduler.h2o_pending_worker_bt_replace
 
 
+def test_h2o_async_barrier_holds_decode_until_swap(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Async: do not schedule decode while Ownership-A pack/swap is pending."""
+    monkeypatch.setattr(envs, "VLLM_H2O", True)
+    scheduler = create_scheduler()
+    (request,) = create_requests(num_requests=1, num_tokens=600)
+    scheduler.add_request(request)
+    monkeypatch.setattr(
+        scheduler.kv_cache_manager, "allocate_h2o_retained", Mock(return_value=[7, 8])
+    )
+    monkeypatch.setattr(scheduler.kv_cache_manager, "swap_h2o_full_attention", Mock())
+    monkeypatch.setattr(scheduler.kv_cache_manager, "abort_h2o_retained", Mock())
+    monkeypatch.setattr(
+        scheduler.kv_cache_manager,
+        "get_block_ids",
+        Mock(return_value=([101, 102],)),
+    )
+
+    pack_step = scheduler.schedule()
+    assert request.request_id in pack_step.h2o_resize_req_ids
+    assert request.h2o_pending_resize
+
+    # Next schedule must skip this request until swap clears pending.
+    blocked = scheduler.schedule()
+    assert request.request_id not in blocked.num_scheduled_tokens
+    assert request.h2o_pending_resize
+
+    scheduler.update_from_output(
+        pack_step,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[1000]],
+            h2o_packed_request_ids=[request.request_id],
+        ),
+    )
+    assert not request.h2o_pending_resize
+
+    decode_step = scheduler.schedule()
+    assert request.request_id in decode_step.num_scheduled_tokens
+    assert request.request_id in decode_step.scheduled_cached_reqs.h2o_replaced_req_ids
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [
