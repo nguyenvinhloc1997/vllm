@@ -461,6 +461,13 @@ class FullAttentionSpec(AttentionSpec):
     cache layout itself.
     """
 
+    h2o_protect: bool = False
+    """
+    When True, this full-attention layer is excluded from H2O compression and
+    must not merge into a compress FA KV-cache bucket. Default False preserves
+    today's single FA bucket.
+    """
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
@@ -489,6 +496,10 @@ class FullAttentionSpec(AttentionSpec):
         assert all(isinstance(spec, FullAttentionSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be FullAttentionSpec."
         )
+        if len({bool(spec.h2o_protect) for spec in specs}) > 1:
+            raise ValueError(
+                "Cannot merge h2o_protect FullAttentionSpec with compress specs"
+            )
 
         sliding_window = set(
             spec.sliding_window for spec in specs if spec.sliding_window is not None
@@ -517,6 +528,7 @@ class FullAttentionSpec(AttentionSpec):
             # If any layer in the group is non-causal, treat the group as
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
+            h2o_protect=bool(specs[0].h2o_protect),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -647,6 +659,7 @@ class RSWASpec(FullAttentionSpec):
             sliding_window=base.sliding_window,
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
+            h2o_protect=base.h2o_protect,
             rswa_window=rswa_windows.pop(),
         )
 

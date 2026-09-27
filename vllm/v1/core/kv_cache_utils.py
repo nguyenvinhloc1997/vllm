@@ -1207,6 +1207,112 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
     return not kv_cache_spec
 
 
+def _prefer_padding_sliding_window_buckets(
+    layer_buckets: list[list[str]],
+    spec_buckets: list[list[KVCacheSpec]],
+    group_size: int,
+) -> int:
+    """(syv) A small sliding-window bucket — e.g. a DFlash drafter's 5 SW layers
+    next to a target's 16 full-attention + 48 mamba layers — would make group_size
+    5 and pad the full-attention layers to 20: 25% more memory for EVERY token of
+    context. Sliding-window groups only ever hold window-sized blocks (the manager
+    frees blocks behind the window), so padding THEM is cheap. When the smallest
+    bucket is sliding-window-only, take the largest common divisor of the other
+    buckets' sizes whose padding of each sliding bucket stays below that bucket's
+    own size (16/48/5 -> 8: no full/mamba padding, 3 padding layers on the 5-layer
+    window group, 9 groups instead of 15)."""
+    from math import gcd
+
+    sw = [
+        i
+        for i, specs in enumerate(spec_buckets)
+        if specs and all(isinstance(sp, SlidingWindowSpec) for sp in specs)
+    ]
+    others = [len(layers) for i, layers in enumerate(layer_buckets) if i not in sw]
+    if not sw or not others:
+        return group_size
+    if min(len(layer_buckets[i]) for i in sw) != group_size:
+        return group_size  # the smallest bucket is not a sliding-window one
+    g_all = 0
+    for n in others:
+        g_all = gcd(g_all, n)
+    for g in range(g_all, group_size, -1):
+        if g_all % g:
+            continue
+        if all(
+            (g - len(layer_buckets[i]) % g) % g <= len(layer_buckets[i]) for i in sw
+        ):
+            logger.info(
+                "Sliding-window bucket(s) are the smallest; using group_size %d "
+                "(pads the sliding-window group instead of the full-attention/"
+                "mamba layers)",
+                g,
+            )
+            return g
+    return group_size
+
+
+def _uniform_page_size_layer_buckets(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> tuple[list[list[str]], list[list[KVCacheSpec]]]:
+    """Bucket layers by mergeable KVCacheSpec (same as hybrid equal-size path)."""
+    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+    for layer_name, layer_spec in kv_cache_spec.items():
+        same_type_layers[layer_spec].append(layer_name)
+
+    layer_buckets: list[list[str]] = []
+    spec_buckets: list[list[KVCacheSpec]] = []
+    for layer_spec, layer_names in same_type_layers.items():
+        for names, specs in zip(layer_buckets, spec_buckets):
+            try:
+                # A raise means that the specs are incompatible.
+                type(specs[0]).merge([*specs, layer_spec])
+            except (AssertionError, ValueError):
+                continue
+            names.extend(layer_names)
+            specs.append(layer_spec)
+            break
+        else:
+            layer_buckets.append(list(layer_names))
+            spec_buckets.append([layer_spec])
+    return layer_buckets, spec_buckets
+
+
+def _uniform_page_size_group_size(
+    layer_buckets: list[list[str]],
+    spec_buckets: list[list[KVCacheSpec]],
+) -> int:
+    """Effective hybrid group_size after min/max heuristic + prefer-SWA."""
+    min_num_layers = min([len(layers) for layers in layer_buckets])
+    group_size = min_num_layers
+    max_num_layers = max([len(layers) for layers in layer_buckets])
+    if max_num_layers < min_num_layers * 1.5:
+        # If the number of layers is not much larger than the minimum number of
+        # layers, use the maximum number of layers as the group size to avoid
+        # too many padding layers. A typical example is gpt-oss-20b + eagle,
+        # with 12 sw + 13 full. We pad it to (13 sw, 13 full) instead of
+        # (12 sw, 24 full). 1.5 is a heuristic to avoid too many padding
+        # layers while accommodating speculative decoding drafters that add
+        # extra layers to one attention type.
+        group_size = max_num_layers
+    else:
+        group_size = _prefer_padding_sliding_window_buckets(
+            layer_buckets, spec_buckets, group_size
+        )
+    return group_size
+
+
+def _probe_group_size_for_test(kv_cache_spec: dict[str, KVCacheSpec]) -> int:
+    """Test helper: return the hybrid equal-size group_size for a kv_cache_spec.
+
+    Shares bucketing + prefer-SWA with `_get_kv_cache_groups_uniform_page_size`.
+    Used by H2O protect-FA grouping probes (Task 0a) so tests assert the
+    diagnostic directly instead of reverse-engineering pad from group counts.
+    """
+    layer_buckets, spec_buckets = _uniform_page_size_layer_buckets(kv_cache_spec)
+    return _uniform_page_size_group_size(layer_buckets, spec_buckets)
+
+
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
@@ -1275,30 +1381,7 @@ def _get_kv_cache_groups_uniform_page_size(
     # Group all layers by kv_cache_spec.
     # E.g., 2 full attention layers and 3 sliding window attention layers,
     # -> (full.0, full.1), (sw.0, sw.1, sw.2).
-    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
-    for layer_name, layer_spec in kv_cache_spec.items():
-        same_type_layers[layer_spec].append(layer_name)
-
-    # Attempt to further merge same-type layers based on whether their KV
-    # cache specs can be merged, to minimize the group count. This benefits
-    # situations where specs share a block layout and differ only in a
-    # property it can reconcile (e.g. full attention layers differing only in
-    # sliding window / attention chunk size).
-    layer_buckets: list[list[str]] = []
-    spec_buckets: list[list[KVCacheSpec]] = []
-    for layer_spec, layer_names in same_type_layers.items():
-        for names, specs in zip(layer_buckets, spec_buckets):
-            try:
-                # A raise means that the specs are incompatible.
-                type(specs[0]).merge([*specs, layer_spec])
-            except (AssertionError, ValueError):
-                continue
-            names.extend(layer_names)
-            specs.append(layer_spec)
-            break
-        else:
-            layer_buckets.append(list(layer_names))
-            spec_buckets.append([layer_spec])
+    layer_buckets, spec_buckets = _uniform_page_size_layer_buckets(kv_cache_spec)
 
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
@@ -1312,18 +1395,7 @@ def _get_kv_cache_groups_uniform_page_size(
     # is the minimum number of layers among all attention types. Need a better
     # strategy if we want to support more complex patterns (e.g., 20 full + 30
     # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in layer_buckets])
-    group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in layer_buckets])
-    if max_num_layers < min_num_layers * 1.5:
-        # If the number of layers is not much larger than the minimum number of
-        # layers, use the maximum number of layers as the group size to avoid
-        # too many padding layers. A typical example is gpt-oss-20b + eagle,
-        # with 12 sw + 13 full. We pad it to (13 sw, 13 full) instead of
-        # (12 sw, 24 full). 1.5 is a heuristic to avoid too many padding
-        # layers while accommodating speculative decoding drafters that add
-        # extra layers to one attention type.
-        group_size = max_num_layers
+    group_size = _uniform_page_size_group_size(layer_buckets, spec_buckets)
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
