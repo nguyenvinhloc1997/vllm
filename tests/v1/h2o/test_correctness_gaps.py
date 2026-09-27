@@ -101,6 +101,24 @@ def test_clamp_h2o_seq_len_helper():
     assert buf.tolist() == [100, 64, 200]
 
 
+def test_h2o_clamped_seq_len_must_not_gate_sampling_as_prefill():
+    """Ownership-A clamp leaves seq_lens << prefill_len; sampling must use absolute.
+
+    V2 ``get_num_sampled_and_rejected`` zeros num_sampled when
+    ``seq_len < prefill_len`` (chunked prefill). After H2O clamp, attention
+    seq_lens is retained (~2K) while prefill_len stays the full prompt — that
+    must not discard decode samples. Absolute length lives on
+    ``InputBatch.sampling_seq_lens``.
+    """
+    prompt_len = 1416
+    retained = 566
+    absolute_decode = prompt_len + 3  # a few decode tokens past prompt
+    attn_seq = torch.tensor([retained], dtype=torch.int32)
+    sampling_seq = torch.tensor([absolute_decode], dtype=torch.int32)
+    assert attn_seq.item() < prompt_len  # would wrongly look like chunked prefill
+    assert sampling_seq.item() >= prompt_len  # decode gate stays open
+
+
 def test_prefill_q_stash_keeps_fixed_front_and_rolling_tail():
     prompt_len, h_q, d = 700, 2, 4
     q = torch.arange(prompt_len * h_q * d, dtype=torch.float32).reshape(

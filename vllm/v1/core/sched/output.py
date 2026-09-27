@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -294,6 +294,12 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # Request IDs whose scheduled tokens first reached prompt_len this step.
+    # Ownership-A resize must only run when update_from_output processes
+    # *this* SchedulerOutput (async scheduling can deliver earlier steps'
+    # outputs after the flag is set on the request).
+    h2o_resize_req_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

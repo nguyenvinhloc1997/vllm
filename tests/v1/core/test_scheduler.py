@@ -66,6 +66,7 @@ def test_h2o_resize_requires_completed_pack(
 
     scheduler_output = scheduler.schedule()
     assert request.h2o_pending_resize
+    assert request.request_id in scheduler_output.h2o_resize_req_ids
     model_output = ModelRunnerOutput(
         req_ids=[request.request_id],
         req_id_to_index={request.request_id: 0},
@@ -76,6 +77,56 @@ def test_h2o_resize_requires_completed_pack(
     scheduler.update_from_output(scheduler_output, model_output)
 
     assert resize.call_count == int(packed)
+    assert not request.h2o_pending_resize
+
+
+def test_h2o_resize_ignores_earlier_inflight_step(monkeypatch: pytest.MonkeyPatch):
+    """Async scheduling: an earlier step's update must not clear pending.
+
+    Under async scheduling, schedule(last-prefill) sets h2o_pending_resize
+    before update_from_output of a prior chunk runs. That prior output has
+    empty h2o_packed_request_ids; clearing pending there permanently skips
+    Ownership-A resize when the pack step's output finally arrives.
+    """
+    monkeypatch.setattr(envs, "VLLM_H2O", True)
+    scheduler = create_scheduler(max_num_batched_tokens=256)
+    (request,) = create_requests(num_requests=1, num_tokens=600)
+    scheduler.add_request(request)
+    resize = Mock()
+    monkeypatch.setattr(scheduler.kv_cache_manager, "resize_h2o_full_attention", resize)
+
+    earlier = scheduler.schedule()
+    assert request.request_id not in earlier.h2o_resize_req_ids
+    assert not request.h2o_pending_resize
+
+    crossing = None
+    for _ in range(8):
+        out = scheduler.schedule()
+        if request.request_id in out.h2o_resize_req_ids:
+            crossing = out
+            break
+    assert crossing is not None
+    assert request.h2o_pending_resize
+
+    # Deliver earlier step first (async order) with empty packed ids.
+    earlier_out = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[]],
+        h2o_packed_request_ids=[],
+    )
+    scheduler.update_from_output(earlier, earlier_out)
+    assert request.h2o_pending_resize
+    assert resize.call_count == 0
+
+    pack_out = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[1000]],
+        h2o_packed_request_ids=[request.request_id],
+    )
+    scheduler.update_from_output(crossing, pack_out)
+    assert resize.call_count == 1
     assert not request.h2o_pending_resize
 
 

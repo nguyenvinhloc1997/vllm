@@ -1362,8 +1362,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else None
             ),
         )
+        from vllm import envs as vllm_envs
         from vllm.v1.h2o.runner_hooks import maybe_clamp_h2o_seq_lens
 
+        # Attention seq_lens must match retained KV after Ownership-A. Sampling
+        # uses absolute transcript length so decode is not mistaken for chunked
+        # prefill (seq_len < prefill_len → num_sampled forced to 0).
+        if vllm_envs.VLLM_H2O:
+            input_batch.sampling_seq_lens = seq_lens.clone()
         maybe_clamp_h2o_seq_lens(
             req_ids,
             input_batch.seq_lens,

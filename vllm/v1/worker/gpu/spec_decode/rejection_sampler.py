@@ -284,9 +284,14 @@ class RejectionSampler:
             max_num_logprobs,
         )
 
+        seq_lens_for_sampling = (
+            input_batch.sampling_seq_lens
+            if input_batch.sampling_seq_lens is not None
+            else input_batch.seq_lens
+        )
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
-            input_batch.seq_lens,
+            seq_lens_for_sampling,
             input_batch.cu_num_logits,
             input_batch.idx_mapping,
             self.sampler.req_states.prefill_len.gpu,

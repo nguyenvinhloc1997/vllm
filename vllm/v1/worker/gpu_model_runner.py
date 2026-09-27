@@ -4224,6 +4224,14 @@ class GPUModelRunner(
         )
         if not remaps:
             return
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "[H2O_DIAG] v1_remap n=%d first=(tok=%s slot=%s)",
+            len(remaps),
+            remaps[0][0],
+            remaps[0][1],
+        )
         for tok_idx, write_slot in remaps:
             for bt in block_tables:
                 if bt.slot_mapping_mode != SlotMappingMode.TOKEN_TO_KV_SLOT:

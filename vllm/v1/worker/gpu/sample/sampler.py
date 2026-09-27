@@ -176,9 +176,16 @@ class Sampler:
         # 1 sampled token per request, except chunked-prefill requests
         # (seq_len < prefill_len) which aren't done prefilling and produce no
         # output token. num_rejected is always 0 here (one logit per request).
+        # H2O may clamp attention seq_lens to retained KV; sampling must use
+        # absolute transcript length when that clamp ran.
+        seq_lens_for_sampling = (
+            input_batch.sampling_seq_lens
+            if input_batch.sampling_seq_lens is not None
+            else input_batch.seq_lens
+        )
         num_sampled, num_rejected = get_num_sampled_and_rejected(
-            input_batch.seq_lens.new_ones(input_batch.num_reqs),
-            input_batch.seq_lens,
+            seq_lens_for_sampling.new_ones(input_batch.num_reqs),
+            seq_lens_for_sampling,
             input_batch.cu_num_logits,
             input_batch.idx_mapping,
             self.req_states.prefill_len.gpu,

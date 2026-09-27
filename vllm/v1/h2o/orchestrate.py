@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.v1.h2o.bi_snap import bi_snap_budget, select_bi_snap
 from vllm.v1.h2o.context import get_h2o_batch_context
 from vllm.v1.h2o.runtime import (
@@ -25,6 +26,8 @@ from vllm.v1.h2o.scores import (
 )
 from vllm.v1.h2o.slots import build_slot_layout
 from vllm.v1.h2o.writers import KeptKvWriter
+
+logger = init_logger(__name__)
 
 
 def run_h2o_after_attention(
@@ -112,8 +115,20 @@ def run_h2o_after_attention(
         if q_positions != expected_q_positions:
             ctx.failed_pack_request_ids.add(req.request_id)
             drop_prefill_q(req.request_id, layer_name=layer_name)
+            logger.info(
+                "[H2O_DIAG] pack_skip incomplete_q req=%s layer=%s",
+                req.request_id,
+                layer_name,
+            )
             continue
 
+        logger.info(
+            "[H2O_DIAG] pack_gather_begin req=%s layer=%s T=%d q_obs=%d",
+            req.request_id,
+            layer_name,
+            req.prompt_len,
+            len(q_positions),
+        )
         k_full, v_full = gather.gather_kv(
             request_index=request_index,
             slots=all_slots,
@@ -122,6 +137,11 @@ def run_h2o_after_attention(
         )
         if k_full.shape[0] != req.prompt_len or v_full.shape[0] != req.prompt_len:
             raise ValueError("gathered K/V length does not match prompt_len")
+        logger.info(
+            "[H2O_DIAG] pack_gather_done req=%s layer=%s",
+            req.request_id,
+            layer_name,
+        )
         k_positions = list(range(req.prompt_len))
         mass = accumulate_attention_mass_chunked(
             q_obs,
@@ -167,3 +187,14 @@ def run_h2o_after_attention(
         )
         if req.request_id not in ctx.failed_pack_request_ids:
             ctx.packed_request_ids.add(req.request_id)
+        logger.info(
+            "[H2O_DIAG] pack_ok req=%s layer=%s num_keep=%d heavy=%d recent=%d "
+            "update_heavy=%s blocks=%d",
+            req.request_id,
+            layer_name,
+            layout.num_keep,
+            len(state.heavy),
+            len(state.recent),
+            state.update_heavy,
+            len(block_ids),
+        )

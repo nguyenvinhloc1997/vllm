@@ -13,6 +13,9 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def maybe_set_h2o_batch_context(
@@ -72,6 +75,15 @@ def maybe_clear_h2o_batch_context() -> list[str]:
         if ctx is not None
         else []
     )
+    if ctx is not None:
+        logger.info(
+            "[H2O_DIAG] clear_batch_ctx packed=%s failed=%s result=%s",
+            sorted(ctx.packed_request_ids),
+            sorted(ctx.failed_pack_request_ids),
+            packed_request_ids,
+        )
+    else:
+        logger.info("[H2O_DIAG] clear_batch_ctx ctx=None")
     clear_h2o_batch_context()
     return packed_request_ids
 
@@ -227,6 +239,15 @@ def maybe_remap_h2o_decode_slots_gpu(
     if not remaps:
         return
 
+    logger.info(
+        "[H2O_DIAG] remap n=%d first=(tok=%s slot=%s) last=(tok=%s slot=%s)",
+        len(remaps),
+        remaps[0][0],
+        remaps[0][1],
+        remaps[-1][0],
+        remaps[-1][1],
+    )
+
     groups = getattr(kv_cache_config, "kv_cache_groups", None) or []
     # Groups are model-static; any H2O runtime's layer set selects FA groups.
     h2o_layers: set[str] | None = None
@@ -266,6 +287,11 @@ def h2o_decode_after_commit(
     """
     if not envs.VLLM_H2O or not commits:
         return
+    logger.info(
+        "[H2O_DIAG] decode_after_commit begin n_reqs=%d positions=%s",
+        len(commits),
+        {k: v for k, v in commits.items()},
+    )
     from vllm.v1.h2o.decode import (
         apply_committed_decode_step,
         apply_committed_decode_step_with_cache,

@@ -12,7 +12,9 @@ def clamp_h2o_seq_len(absolute_seq_len: int, retained_kv_len: int) -> int:
 
     After Ownership-A, the physical cache holds ``~2K`` (+ decode growth inside
     the budget). Attention metadata ``seq_lens`` must match that retained
-    length; absolute RoPE / transcript length stays elsewhere (positions).
+    length; absolute RoPE / transcript length stays on sampling seq_lens
+    (``InputBatch.sampling_seq_lens``) so ``seq_len < prefill_len`` is not
+    mistaken for chunked prefill.
     """
     if retained_kv_len <= 0:
         return int(absolute_seq_len)

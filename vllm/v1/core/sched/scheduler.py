@@ -1469,12 +1469,17 @@ class Scheduler(SchedulerInterface):
                 request.num_tokens + request.num_output_placeholders
             )
             # H2O: mark the step that first reaches prompt_len via scheduled
-            # prefill tokens (not a prefix-cache full hit).
-            request.h2o_pending_resize = bool(
+            # prefill tokens (not a prefix-cache full hit). Stamp the req id
+            # on this SchedulerOutput so async in-flight earlier steps cannot
+            # clear the pending flag before the pack step's output arrives.
+            crossed_prompt = bool(
                 envs.VLLM_H2O
                 and was_below_prompt
                 and request.num_computed_tokens >= request.num_prompt_tokens
             )
+            request.h2o_pending_resize = crossed_prompt
+            if crossed_prompt:
+                scheduler_output.h2o_resize_req_ids.append(req_id)
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
@@ -1921,6 +1926,19 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            if (
+                envs.VLLM_H2O
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                logger.info(
+                    "[H2O_DIAG] update_out req=%s n_gen=%d num_computed=%d "
+                    "prompt=%d pending_resize=%s",
+                    req_id,
+                    len(generated_token_ids) if generated_token_ids else 0,
+                    request.num_computed_tokens,
+                    request.num_prompt_tokens,
+                    request.h2o_pending_resize,
+                )
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -1970,21 +1988,34 @@ class Scheduler(SchedulerInterface):
             # H2O Ownership-A: after the step that finishes the prompt, shrink
             # full-attention block tables to ceil(2K/block_size). Worker
             # repacks kept KV into the leading pages during that same step.
-            # Flag is set in _update_after_schedule only when scheduled tokens
-            # cross prompt_len (skips prefix-cache full hits).
-            if (
-                request.h2o_pending_resize
-                and req_id in model_runner_output.h2o_packed_request_ids
-            ):
-                from vllm.v1.h2o.ownership import num_keep_tokens
+            # Gate on scheduler_output.h2o_resize_req_ids (this step crossed
+            # prompt_len), not the sticky request flag alone — under async
+            # scheduling an earlier in-flight step's update can otherwise
+            # clear pending before the pack step's output arrives.
+            if req_id in scheduler_output.h2o_resize_req_ids:
+                if req_id in model_runner_output.h2o_packed_request_ids:
+                    from vllm.v1.h2o.ownership import num_keep_tokens
 
-                self.kv_cache_manager.resize_h2o_full_attention(
-                    req_id,
-                    num_keep_tokens(
+                    keep_n = num_keep_tokens(
                         request.num_prompt_tokens, float(envs.VLLM_H2O_RATIO)
-                    ),
-                )
-            if request.h2o_pending_resize:
+                    )
+                    logger.info(
+                        "[H2O_DIAG] resize_begin req=%s prompt=%d num_keep=%d",
+                        req_id,
+                        request.num_prompt_tokens,
+                        keep_n,
+                    )
+                    self.kv_cache_manager.resize_h2o_full_attention(
+                        req_id,
+                        keep_n,
+                    )
+                    logger.info("[H2O_DIAG] resize_done req=%s", req_id)
+                else:
+                    logger.info(
+                        "[H2O_DIAG] resize_skip_no_pack req=%s packed=%s",
+                        req_id,
+                        sorted(model_runner_output.h2o_packed_request_ids),
+                    )
                 request.h2o_pending_resize = False
 
             # Free encoder inputs only after the step has actually executed.

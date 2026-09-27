@@ -112,6 +112,10 @@ class InputBatch:
     # stays valid for every replay the graph serves.
     max_query_len: int | None = None
 
+    # Absolute transcript seq_lens for sampling when H2O clamps attention
+    # seq_lens to retained KV length. None when no clamp applied this step.
+    sampling_seq_lens: torch.Tensor | None = None
+
     @classmethod
     def make_dummy(
         cls,
