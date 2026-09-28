@@ -3,7 +3,7 @@
 """Warm up Qwen Triton kernels from the loaded model's compile keys."""
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -273,6 +273,99 @@ def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
     )
 
 
+def _warm_gdn_recoverssm_kernels(
+    runner: Any, static_forward_context: Any, device: torch.device
+) -> None:
+    """Compile the RecoverSSM verify-record, commit and align-postprocess
+    variants a mixed prefill + spec-decode step would otherwise JIT on the
+    request path. Real caches are touched only at the null block (0); the
+    commit plan writes only a throwaway context's scratch."""
+    from vllm.model_executor.layers.mamba.damp_gdn_update import damp_fused_update
+    from vllm.model_executor.layers.mamba.gdn_recoverssm import (
+        GDNRecoverSSMCommitContext,
+    )
+    from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
+        fused_sigmoid_gating_delta_rule_update,
+    )
+    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+    from vllm.v1.worker.gpu.model_states.recoverssm import (
+        _postprocess_recoverssm_align_kernel,
+    )
+
+    groups = runner.kv_cache_config.kv_cache_groups
+    for gid, group in enumerate(groups):
+        layers: list[Any] = [static_forward_context.get(n) for n in group.layer_names]
+        if layers and all(_is_qwen_gdn_layer(layer) for layer in layers):
+            break
+    else:
+        return
+    layer = layers[0]
+    kv = layer.kv_cache
+    h = int(layer.num_k_heads) // int(layer.tp_size)
+    hv = int(layer.num_v_heads) // int(layer.tp_size)
+    s = 1 + int(layer.num_spec)
+    dtype = kv[0].dtype  # conv state dtype == activation dtype
+
+    def ints(*shape: int, fill: int = NULL_BLOCK_ID, dt=torch.int32):
+        return torch.full(shape, fill, dtype=dt, device=device)
+
+    # Verify in record mode: one spec row whose checkpoint is the null block.
+    q = torch.zeros((1, s, h, int(layer.head_k_dim)), dtype=dtype, device=device)
+    v = torch.zeros((1, s, hv, int(layer.head_v_dim)), dtype=dtype, device=device)
+    a = torch.zeros((1, s, hv), dtype=dtype, device=device)
+    spec_update = (
+        damp_fused_update
+        if kv[1].dtype == torch.uint8
+        else fused_sigmoid_gating_delta_rule_update
+    )
+    spec_update(
+        A_log=layer.A_log,
+        a=a,
+        b=a,
+        dt_bias=layer.dt_bias,
+        q=q,
+        k=q,
+        v=v,
+        initial_state=kv[1],
+        inplace_final_state=True,
+        cu_seqlens=torch.tensor([0, s], dtype=torch.int32, device=device),
+        ssm_state_indices=ints(1, 1),
+        num_accepted_tokens=ints(1, fill=1),
+        use_qk_l2norm_in_kernel=True,
+        recoverssm_records=(kv[2], kv[3], kv[4]),
+    )
+
+    # Commit + align postprocess, without and with request_indices (the
+    # mixed-batch variant). The null source makes every kernel return early.
+    align = layer.cache_config.mamba_cache_mode == "align"
+    block_size = int(group.kv_cache_spec.block_size)
+    width = runner.block_tables.input_block_tables[gid].shape[1]
+    ctx = GDNRecoverSSMCommitContext.create(layers, spec_query_len=s, max_num_reqs=1)
+    num_sampled = ints(1, fill=s)
+    num_computed = ints(1) if align else None
+    for request_indices in (None, ints(1, fill=0)):
+        ctx.commit(
+            num_sampled,
+            ints(1, 1)[:, 0],
+            torch.tensor([0, s], dtype=torch.int32, device=device),
+            request_indices=request_indices,
+            block_table=ints(1, width) if align else None,
+            num_computed_tokens=num_computed,
+            mamba_block_size=block_size if align else None,
+        )
+        if align:
+            _postprocess_recoverssm_align_kernel[(1,)](
+                ints(1, fill=-1, dt=torch.int64),  # idx_mapping: no request
+                num_sampled,
+                request_indices,
+                num_computed,
+                ints(1),
+                ints(1),
+                MAMBA_BLOCK_SIZE=block_size,
+                BLOCK_TABLE_WIDTH=width,
+            )
+
+
 def _synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.accelerator.synchronize(device)
@@ -293,9 +386,8 @@ def qwen_triton_warmup(
     device = runner.device
     logger.info("Warming up Qwen GDN Triton kernels for model_type=%s.", model_type)
 
-    gdn_config = _qwen_gdn_warmup_config(
-        runner.compilation_config.static_forward_context
-    )
+    static_forward_context = runner.compilation_config.static_forward_context
+    gdn_config = _qwen_gdn_warmup_config(static_forward_context)
     if gdn_config is None:
         return
 
@@ -306,4 +398,8 @@ def qwen_triton_warmup(
     # Pooling only runs full prefills; the decode update kernel is unused.
     if not runner.is_pooling_model:
         _warm_fused_sigmoid_gating_delta_rule_update_kernel(device, gdn_config)
+        layer = next(_iter_qwen_gdn_layers(static_forward_context))
+        if getattr(getattr(layer, "cache_config", None), "use_gdn_recoverssm", False):
+            logger.info("Warming up GDN RecoverSSM Triton kernels.")
+            _warm_gdn_recoverssm_kernels(runner, static_forward_context, device)
     _synchronize_device(device)
