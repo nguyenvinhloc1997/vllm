@@ -511,6 +511,9 @@ class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
+    # RecoverSSM is only wired and tested for the dense Qwen3.5 GDN models.
+    supports_replayssm = False  # type: ignore[misc]
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
@@ -759,6 +762,8 @@ class Qwen3_5_MoeMixtureOfExperts(MixtureOfExperts):
 class Qwen3_5MoeForConditionalGeneration(
     Qwen3_5ForConditionalGeneration, Qwen3_5_MoeMixtureOfExperts
 ):
+    # RecoverSSM is only wired and tested for the dense Qwen3.5 GDN models.
+    supports_replayssm = False  # type: ignore[misc]
     # For MoE LoRA weights loading
     is_3d_moe_weight: bool = True
 
