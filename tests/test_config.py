@@ -144,6 +144,58 @@ def test_kda_recoverssm_derivation_is_revalidated():
         VllmConfig.validate_mamba_cached_kernel(config)
 
 
+def _gdn_replayssm_config(**overrides):
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            use_replayssm=True,
+            use_kda_recoverssm=False,
+            use_gdn_recoverssm=False,
+            mamba_cache_mode="align",
+        ),
+        num_speculative_tokens=7,
+        model_config=SimpleNamespace(
+            supports_replayssm=True,
+            architecture="Qwen3_5ForConditionalGeneration",
+        ),
+        mamba_config=SimpleNamespace(
+            backend=MambaBackendEnum.TRITON,
+            enable_stochastic_rounding=False,
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        kv_transfer_config=None,
+        use_v2_model_runner=True,
+    )
+    for key, value in overrides.items():
+        setattr(config, key, value)
+    return config
+
+
+def test_gdn_recoverssm_derivation():
+    config = _gdn_replayssm_config()
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert config.cache_config.use_gdn_recoverssm
+    assert not config.cache_config.use_kda_recoverssm
+
+    config.cache_config.mamba_cache_mode = "none"
+    config.use_v2_model_runner = False
+    with pytest.raises(ValueError, match="V2 model runner"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config = _gdn_replayssm_config()
+    config.cache_config.mamba_cache_mode = "all"
+    with pytest.raises(ValueError, match="only none and align"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config = _gdn_replayssm_config(num_speculative_tokens=0)
+    with pytest.raises(ValueError, match="requires speculative decoding"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config = _gdn_replayssm_config()
+    config.cache_config.use_replayssm = False
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert not config.cache_config.use_gdn_recoverssm
+
+
 def test_per_request_spec_decode_metrics_requires_spec_decode():
     # The flag only makes sense with speculative decoding configured; enabling
     # it without --speculative-config should fail fast rather than silently

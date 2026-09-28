@@ -159,6 +159,8 @@ def test_registry_is_pp(model_arch, is_pp, init_cuda):
         ("NemotronHForCausalLM", True),
         ("KimiLinearForCausalLM", not current_platform.is_rocm()),
         ("KimiK3ForConditionalGeneration", not current_platform.is_rocm()),
+        ("Qwen3_5ForConditionalGeneration", True),
+        ("Qwen3_5ForCausalLM", True),
         ("Mamba2ForCausalLM", False),
         ("Zamba2ForCausalLM", False),
     ],
