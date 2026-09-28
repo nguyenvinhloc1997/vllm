@@ -107,7 +107,9 @@ def _gdn_replayssm_config(**overrides):
             backend=MambaBackendEnum.TRITON,
             enable_stochastic_rounding=False,
         ),
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, tensor_parallel_size=1
+        ),
         kv_transfer_config=None,
         use_v2_model_runner=True,
     )
@@ -140,6 +142,11 @@ def test_gdn_recoverssm_derivation():
     config.cache_config.use_replayssm = False
     VllmConfig.validate_mamba_cached_kernel(config)
     assert not config.cache_config.use_gdn_recoverssm
+
+    config = _gdn_replayssm_config()
+    config.parallel_config.tensor_parallel_size = 2
+    with pytest.raises(ValueError, match="tensor_parallel_size=1"):
+        VllmConfig.validate_mamba_cached_kernel(config)
 
 
 def test_per_request_spec_decode_metrics_requires_spec_decode():

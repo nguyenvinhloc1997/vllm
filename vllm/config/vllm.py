@@ -2893,6 +2893,10 @@ class VllmConfig:
                 raise ValueError(
                     "RecoverSSM currently requires pipeline_parallel_size=1"
                 )
+            if self.parallel_config.tensor_parallel_size > 1:
+                raise ValueError(
+                    "GDN RecoverSSM currently requires tensor_parallel_size=1"
+                )
         if self.cache_config.use_kda_recoverssm:
             if self.model_config is not None and self.model_config.architecture not in (
                 "KimiLinearForCausalLM",
