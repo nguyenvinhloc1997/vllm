@@ -2848,16 +2848,51 @@ class VllmConfig:
 
     @model_validator(mode="after")
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
+        _GDN_RECOVERSSM_ARCHS = (
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5ForCausalLM",
+        )
         if not self.cache_config.use_replayssm:
             self.cache_config.use_kda_recoverssm = False
+            self.cache_config.use_gdn_recoverssm = False
             return self
-        self.cache_config.use_kda_recoverssm = self.num_speculative_tokens > 0
+        arch = self.model_config.architecture if self.model_config else None
+        is_gdn = arch in _GDN_RECOVERSSM_ARCHS
+        self.cache_config.use_gdn_recoverssm = (
+            is_gdn and self.num_speculative_tokens > 0
+        )
+        self.cache_config.use_kda_recoverssm = (
+            not is_gdn and self.num_speculative_tokens > 0
+        )
 
         if self.model_config is not None and not self.model_config.supports_replayssm:
             raise ValueError(
                 "--use-replayssm is not supported for architecture "
                 f"{self.model_config.architecture!r}"
             )
+        if is_gdn and not self.cache_config.use_gdn_recoverssm:
+            raise ValueError(
+                "--use-replayssm on Qwen3.5 GDN requires speculative decoding "
+                "(it enables RecoverSSM)"
+            )
+        if self.cache_config.use_gdn_recoverssm:
+            if self.mamba_config.enable_stochastic_rounding:
+                raise ValueError(
+                    "GDN RecoverSSM does not support stochastic-rounding state caches"
+                )
+            if self.cache_config.mamba_cache_mode not in ("none", "align"):
+                raise ValueError(
+                    "RecoverSSM supports only none and align Mamba cache modes"
+                )
+            if not self.use_v2_model_runner:
+                raise ValueError(
+                    "GDN RecoverSSM requires the V2 model runner "
+                    "(VLLM_USE_V2_MODEL_RUNNER=1); V1 never commits the state"
+                )
+            if self.parallel_config.pipeline_parallel_size > 1:
+                raise ValueError(
+                    "RecoverSSM currently requires pipeline_parallel_size=1"
+                )
         if self.cache_config.use_kda_recoverssm:
             if self.model_config is not None and self.model_config.architecture not in (
                 "KimiLinearForCausalLM",

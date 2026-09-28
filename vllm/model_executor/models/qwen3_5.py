@@ -29,8 +29,8 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from vllm.compilation.decorators import support_torch_compile
 import vllm.envs as envs
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -72,10 +72,11 @@ from .interfaces import (
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsReplaySSM,
     _require_is_multimodal,
 )
-from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from .ngm_residual import NgramResidual, parse_layer_ids, update_input_ids
+from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from .qwen3_next import (
     Qwen3NextAttention,
     Qwen3NextDecoderLayer,
@@ -298,9 +299,7 @@ class Qwen3_5Model(Qwen3NextModel):
         self._ngm_ids: torch.Tensor | None = None
         self._ngm_enabled = False
         if envs.VLLM_NGM:
-            layer_ids = parse_layer_ids(
-                envs.VLLM_NGM_LAYERS, config.num_hidden_layers
-            )
+            layer_ids = parse_layer_ids(envs.VLLM_NGM_LAYERS, config.num_hidden_layers)
             memory = NgramResidual(
                 self.embed_tokens,
                 embedding_dim=config.hidden_size,
@@ -355,6 +354,7 @@ class Qwen3_5ForCausalLMBase(
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsReplaySSM,
 ):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -528,7 +528,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
     info=Qwen3_5ProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
-class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
+class Qwen3_5ForConditionalGeneration(
+    Qwen3VLForConditionalGeneration, IsHybrid, SupportsReplaySSM
+):
     supports_multimodal_pruning = True
 
     hf_to_vllm_mapper = (
