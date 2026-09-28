@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GDN decode update that reads and writes the packed DAMP page in place.
 
 State columns stay in packed order: the fp16 channels, then the int8
@@ -12,6 +13,11 @@ from __future__ import annotations
 import torch
 
 from vllm.model_executor.layers.mamba.damp_runtime import _ensure, _views
+from vllm.model_executor.layers.mamba.gdn_recoverssm_ops import (
+    _damp_quantize,
+    _gdn_rank1,
+    check_recoverssm_records,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -21,6 +27,7 @@ from vllm.triton_utils import tl, triton
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        "RECORD": lambda args: args["rec_c"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -44,6 +51,12 @@ def _damp_update_kernel(
     cu_seqlens,
     ssm_state_indices,
     num_accepted_tokens,
+    rec_c,
+    rec_k,
+    rec_d,
+    stride_rec_c,
+    stride_rec_k,
+    stride_rec_d,
     scale,
     N: tl.int64,
     T: tl.int64,
@@ -63,6 +76,8 @@ def _damp_update_kernel(
     IS_VARLEN: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    RECORD: tl.constexpr,
+    REC_S: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -81,9 +96,7 @@ def _damp_update_kernel(
     if T == 0:
         return
 
-    pos = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
-    mask_k = pos < K
     mask_v = o_v < V
     p_q = q + (bos * HV + i_hv) * K
     p_k = k + (bos * HV + i_hv) * K
@@ -128,20 +141,27 @@ def _damp_update_kernel(
                 other=0,
             ).to(tl.float32)
         if N_LO > 0:
-            b_lo = tl.load(
-                h0_lo
-                + state_idx * stride_lo
-                + (i_hv * V + o_v[:, None]) * N_LO
-                + lo_lane[None, :],
-                mask=mask_v[:, None] & (lo_lane[None, :] < N_LO),
-                other=0,
-            ).to(tl.float32) * b_scale
+            b_lo = (
+                tl.load(
+                    h0_lo
+                    + state_idx * stride_lo
+                    + (i_hv * V + o_v[:, None]) * N_LO
+                    + lo_lane[None, :],
+                    mask=mask_v[:, None] & (lo_lane[None, :] < N_LO),
+                    other=0,
+                ).to(tl.float32)
+                * b_scale
+            )
 
     for i_t in range(0, T):
         b_q_hi = tl.load(p_q + hi_lane, mask=hi_lane < N_HI, other=0).to(tl.float32)
         b_k_hi = tl.load(p_k + hi_lane, mask=hi_lane < N_HI, other=0).to(tl.float32)
-        b_q_lo = tl.load(p_q + N_HI + lo_lane, mask=lo_lane < N_LO, other=0).to(tl.float32)
-        b_k_lo = tl.load(p_k + N_HI + lo_lane, mask=lo_lane < N_LO, other=0).to(tl.float32)
+        b_q_lo = tl.load(p_q + N_HI + lo_lane, mask=lo_lane < N_LO, other=0).to(
+            tl.float32
+        )
+        b_k_lo = tl.load(p_k + N_HI + lo_lane, mask=lo_lane < N_LO, other=0).to(
+            tl.float32
+        )
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_b = tl.load(p_b).to(tl.float32)
         x = tl.load(p_a).to(tl.float32) + tl.load(p_dt_bias).to(tl.float32)
@@ -165,42 +185,58 @@ def _damp_update_kernel(
         b_v -= tl.sum(b_hi * b_k_hi[None, :], 1)
         b_v -= tl.sum(b_lo * b_k_lo[None, :], 1)
         b_v *= b_beta
-        b_hi += b_v[:, None] * b_k_hi[None, :]
-        b_lo += b_v[:, None] * b_k_lo[None, :]
+        if RECORD:
+            p_rc = rec_c + state_idx * stride_rec_c + (i_hv * REC_S + i_t) * V
+            tl.store(p_rc + o_v, b_v, mask=mask_v & (i_t < REC_S))
+            if i_v == 0:
+                p_rk = rec_k + state_idx * stride_rec_k + (i_hv * REC_S + i_t) * K
+                tl.store(p_rk + hi_lane, b_k_hi, mask=(hi_lane < N_HI) & (i_t < REC_S))
+                tl.store(
+                    p_rk + N_HI + lo_lane,
+                    b_k_lo,
+                    mask=(lo_lane < N_LO) & (i_t < REC_S),
+                )
+                tl.store(
+                    rec_d + state_idx * stride_rec_d + i_hv * REC_S + i_t,
+                    decay,
+                    mask=i_t < REC_S,
+                )
+        b_hi = _gdn_rank1(b_hi, b_v, b_k_hi)
+        b_lo = _gdn_rank1(b_lo, b_v, b_k_lo)
         b_o = tl.sum(b_hi * b_q_hi[None, :], 1) + tl.sum(b_lo * b_q_lo[None, :], 1)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
-        final_state_idx = tl.load(
-            ssm_state_indices + i_n * stride_indices_seq + i_t
-        ).to(tl.int64)
-        if final_state_idx > 0:
-            if N_HI > 0:
-                tl.store(
-                    h0_hi
-                    + final_state_idx * stride_hi
-                    + (i_hv * V + o_v[:, None]) * N_HI
-                    + hi_lane[None, :],
-                    b_hi.to(tl.float16),
-                    mask=mask_v[:, None] & (hi_lane[None, :] < N_HI),
-                )
-            if N_LO > 0:
-                amax = tl.max(tl.abs(b_lo))
-                sc = tl.maximum(amax, 1e-8) / 127.0
-                qv = b_lo / sc
-                codes = tl.where(qv >= 0, tl.floor(qv + 0.5), tl.ceil(qv - 0.5))
-                codes = tl.minimum(tl.maximum(codes, -127.0), 127.0)
-                tl.store(
-                    h0_lo
-                    + final_state_idx * stride_lo
-                    + (i_hv * V + o_v[:, None]) * N_LO
-                    + lo_lane[None, :],
-                    codes.to(tl.int8),
-                    mask=mask_v[:, None] & (lo_lane[None, :] < N_LO),
-                )
-                tl.store(
-                    h0_scale + final_state_idx * stride_scale + i_hv * N_TILES + i_v,
-                    sc,
-                )
+        if not RECORD:
+            final_state_idx = tl.load(
+                ssm_state_indices + i_n * stride_indices_seq + i_t
+            ).to(tl.int64)
+            if final_state_idx > 0:
+                if N_HI > 0:
+                    tl.store(
+                        h0_hi
+                        + final_state_idx * stride_hi
+                        + (i_hv * V + o_v[:, None]) * N_HI
+                        + hi_lane[None, :],
+                        b_hi.to(tl.float16),
+                        mask=mask_v[:, None] & (hi_lane[None, :] < N_HI),
+                    )
+                if N_LO > 0:
+                    codes, sc = _damp_quantize(b_lo)
+                    tl.store(
+                        h0_lo
+                        + final_state_idx * stride_lo
+                        + (i_hv * V + o_v[:, None]) * N_LO
+                        + lo_lane[None, :],
+                        codes.to(tl.int8),
+                        mask=mask_v[:, None] & (lo_lane[None, :] < N_LO),
+                    )
+                    tl.store(
+                        h0_scale
+                        + final_state_idx * stride_scale
+                        + i_hv * N_TILES
+                        + i_v,
+                        sc,
+                    )
 
         p_q += HV * K
         p_k += HV * K
@@ -228,6 +264,7 @@ def damp_fused_update(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    recoverssm_records: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ):
     """Same call as the fp16 update. ``initial_state`` is the uint8 page."""
     if is_kda:
@@ -236,7 +273,8 @@ def damp_fused_update(
         raise RuntimeError("DAMP update stores through the packed page")
     if initial_state is None or ssm_state_indices is None:
         raise RuntimeError("DAMP update requires the packed page and state indices")
-    B, T, H, K, V = *k.shape, v.shape[-1]
+    B, T, H, K = k.shape
+    V = v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
@@ -259,6 +297,18 @@ def damp_fused_update(
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride(0), 1
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+    if recoverssm_records is not None:
+        # Record stores index by the loaded checkpoint `state_idx`.
+        check_recoverssm_records(ssm_state_indices, recoverssm_records, HV, K, V)
+        rec_c, rec_k, rec_d = recoverssm_records
+        assert rec_c.stride()[1:] == (rec_c.shape[2] * V, V, 1)
+        assert rec_k.stride()[1:] == (rec_k.shape[2] * K, K, 1)
+        assert rec_d.stride()[1:] == (rec_d.shape[2], 1)
+        rec_strides = (rec_c.stride(0), rec_k.stride(0), rec_d.stride(0))
+        rec_s = rec_c.shape[2]
+    else:
+        rec_c = rec_k = rec_d = None
+        rec_strides, rec_s = (0, 0, 0), 1
     _damp_update_kernel[(NK, NV, N * HV)](
         A_log=A_log,
         a=a.contiguous(),
@@ -279,6 +329,12 @@ def damp_fused_update(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
+        rec_c=rec_c,
+        rec_k=rec_k,
+        rec_d=rec_d,
+        stride_rec_c=rec_strides[0],
+        stride_rec_k=rec_strides[1],
+        stride_rec_d=rec_strides[2],
         scale=scale,
         N=N,
         T=T,
@@ -294,6 +350,7 @@ def damp_fused_update(
         N_TILES=4,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        REC_S=rec_s,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         num_warps=4,
         num_stages=3,

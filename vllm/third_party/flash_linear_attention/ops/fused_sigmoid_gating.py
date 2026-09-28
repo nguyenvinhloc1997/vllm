@@ -9,6 +9,10 @@
 
 import torch
 
+from vllm.model_executor.layers.mamba.gdn_recoverssm_ops import (
+    _gdn_rank1,
+    check_recoverssm_records,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -18,6 +22,7 @@ from vllm.triton_utils import tl, triton
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        "RECORD": lambda args: args["rec_c"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -37,6 +42,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     cu_seqlens,
     ssm_state_indices,
     num_accepted_tokens,
+    rec_c,
+    rec_k,
+    rec_d,
+    stride_rec_c,
+    stride_rec_k,
+    stride_rec_d,
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
@@ -57,6 +68,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_VARLEN: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    RECORD: tl.constexpr,
+    REC_S: tl.constexpr,
     IS_KDA: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -141,33 +154,52 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_q = b_q * scale
         # [BV, BK]
         if not IS_KDA:
-            b_h *= tl.exp(b_g)
+            b_decay = tl.exp(b_g)
+            b_h *= b_decay
         else:
             b_h *= tl.exp(b_g[None, :])
         # [BV]
         b_v -= tl.sum(b_h * b_k[None, :], 1)
         b_v *= b_beta
+        if RECORD:
+            tl.store(
+                rec_c + state_idx * stride_rec_c + (i_hv * REC_S + i_t) * V + o_v,
+                b_v,
+                mask=mask_v & (i_t < REC_S),
+            )
+            if i_v == 0:
+                tl.store(
+                    rec_k + state_idx * stride_rec_k + (i_hv * REC_S + i_t) * K + o_k,
+                    b_k,
+                    mask=mask_k & (i_t < REC_S),
+                )
+                tl.store(
+                    rec_d + state_idx * stride_rec_d + i_hv * REC_S + i_t,
+                    b_decay,
+                    mask=i_t < REC_S,
+                )
         # [BV, BK]
-        b_h += b_v[:, None] * b_k[None, :]
+        b_h = _gdn_rank1(b_h, b_v, b_k)
         # [BV]
         b_o = tl.sum(b_h * b_q[None, :], 1)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # keep the states for multi-query tokens
-        if INPLACE_FINAL_STATE:
-            # Load state index and check for invalid entries
-            final_state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + i_t
-            ).to(tl.int64)
-            # Only store if state index is valid (not NULL_BLOCK_ID=0)
-            if final_state_idx > 0:
-                p_ht = ht + final_state_idx * stride_final_state_token
+        if not RECORD:
+            if INPLACE_FINAL_STATE:
+                # Load state index and check for invalid entries
+                final_state_idx = tl.load(
+                    ssm_state_indices + i_n * stride_indices_seq + i_t
+                ).to(tl.int64)
+                # Only store if state index is valid (not NULL_BLOCK_ID=0)
+                if final_state_idx > 0:
+                    p_ht = ht + final_state_idx * stride_final_state_token
+                    p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+                    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+            else:
+                p_ht = ht + (bos + i_t) * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
-        else:
-            p_ht = ht + (bos + i_t) * stride_final_state_token
-            p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
         # Update pointers for next timestep
         p_q += H * K
@@ -196,6 +228,7 @@ def fused_sigmoid_gating_delta_rule_update(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    recoverssm_records: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -238,6 +271,22 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
+    if recoverssm_records is not None:
+        if is_kda:
+            raise ValueError("GDN RecoverSSM records are for scalar-gate GDN")
+        # Record stores index by the loaded checkpoint `state_idx`.
+        assert initial_state is not None and ssm_state_indices is not None
+        check_recoverssm_records(ssm_state_indices, recoverssm_records, HV, K, V)
+        rec_c, rec_k, rec_d = recoverssm_records
+        assert rec_c.stride()[1:] == (rec_c.shape[2] * V, V, 1)
+        assert rec_k.stride()[1:] == (rec_k.shape[2] * K, K, 1)
+        assert rec_d.stride()[1:] == (rec_d.shape[2], 1)
+        rec_strides = (rec_c.stride(0), rec_k.stride(0), rec_d.stride(0))
+        rec_s = rec_c.shape[2]
+    else:
+        rec_c = rec_k = rec_d = None
+        rec_strides, rec_s = (0, 0, 0), 1
+
     grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -255,6 +304,12 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
+        rec_c=rec_c,
+        rec_k=rec_k,
+        rec_d=rec_d,
+        stride_rec_c=rec_strides[0],
+        stride_rec_k=rec_strides[1],
+        stride_rec_d=rec_strides[2],
         scale=scale,
         N=N,
         T=T,
@@ -271,6 +326,7 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_indices_tok=stride_indices_tok,
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        REC_S=rec_s,
         IS_KDA=is_kda,
         num_warps=num_warps,
         num_stages=num_stages,

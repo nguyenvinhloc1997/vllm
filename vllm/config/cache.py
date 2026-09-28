@@ -206,6 +206,10 @@ class CacheConfig:
     but this is not required."""
     use_kda_recoverssm: bool = field(default=False, init=False)
     """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
+    use_gdn_recoverssm: bool = field(default=False, init=False)
+    """Whether Qwen3.5 GDN uses RecoverSSM speculative decode (plain or DAMP
+    state): one checkpoint plus a per-token record instead of per-draft
+    state blocks."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
