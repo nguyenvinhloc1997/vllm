@@ -284,7 +284,10 @@ def _prepare_commit_plan_kernel(
         )
         final_num_computed = num_computed + commit_len
         final_state_col = tl.minimum(
-            final_num_computed // mamba_block_size, block_table_width - 1
+            # The state after n tokens lives in column (n - 1) // block_size, as in
+            # the rest of align mode; n // block_size is unallocated at a boundary.
+            (final_num_computed - 1) // mamba_block_size,
+            block_table_width - 1,
         )
         final_state_idx = tl.load(
             block_table_ptr

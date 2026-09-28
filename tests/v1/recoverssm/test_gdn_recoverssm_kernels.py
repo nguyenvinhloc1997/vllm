@@ -270,3 +270,35 @@ def test_align_boundary_and_final(request, fmt):
     for r in range(2):
         assert torch.equal(st[block_table[r, 0]], base[base_idx[r, 3]])  # boundary
         assert torch.equal(st[block_table[r, 1]], base[base_idx[r, 5]])  # final
+
+
+@pytest.mark.parametrize("fmt", ["plain", "damp"])
+def test_align_commit_ending_exactly_on_block_boundary(request, fmt):
+    """10 computed + 6 accepted = 16 = block size: the final state belongs in
+    column 0 (same as the boundary). Column 1 must not be written: at that
+    point the scheduler has not allocated it (regression: n // block_size)."""
+    if fmt == "damp":
+        request.getfixturevalue("damp_env")
+        s0, base, base_idx, _, st, rec, rec_idx, _ = _damp_baseline_and_record(2, 19)
+    else:
+        s0, base, base_idx, _, st, rec, rec_idx, _ = _plain_baseline_and_record(
+            2, 19, torch.float16
+        )
+    num_blocks = st.shape[0]
+    extra = torch.arange(num_blocks, num_blocks + 2, device=DEV, dtype=torch.int32)
+    st = torch.cat([st, torch.zeros_like(st[:2])])
+    rec = tuple(torch.cat([t, torch.zeros_like(t[:2])]) for t in rec)
+    block_table = torch.stack([rec_idx[:, 0], extra], dim=1).contiguous()
+    _commit(
+        st,
+        rec,
+        _conv(st.shape[0], 8),
+        rec_idx,
+        6,
+        block_table=block_table,
+        num_computed_tokens=torch.full((2,), 10, device=DEV, dtype=torch.int32),
+        mamba_block_size=16,
+    )
+    for r in range(2):
+        assert torch.equal(st[block_table[r, 0]], base[base_idx[r, 5]])  # final
+        assert not st[block_table[r, 1]].any()  # stale column untouched
