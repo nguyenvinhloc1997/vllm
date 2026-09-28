@@ -165,6 +165,7 @@ from vllm.v1.worker.utils import (
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
     publish_issued_block_ids,
+    set_kernel_blocks_per_block,
 )
 from vllm.v1.worker.workspace import use_workspace_lane
 
@@ -620,6 +621,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+        )
+        # Let block-id keyed backends map issued ids to their kernel blocks.
+        set_kernel_blocks_per_block(
+            {
+                tuple(sorted(group.layer_names)): bpk
+                for group, bpk in zip(
+                    kv_cache_config.kv_cache_groups,
+                    self.block_tables.blocks_per_kv_block,
+                )
+            }
         )
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,

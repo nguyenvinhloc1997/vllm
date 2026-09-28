@@ -313,6 +313,12 @@ class AttentionGroup:
 _issued_block_ids: tuple[int, tuple[int, ...]] = (0, ())
 
 
+# Kernel blocks per KV cache block for each group, keyed by the group's sorted
+# layer names (a backend builder's natural group key). A block id b of such a
+# group covers kernel block ids b * n .. b * n + n - 1.
+_kernel_blocks_per_block: dict[tuple[str, ...], int] = {}
+
+
 def publish_issued_block_ids(block_ids: list[int] | None) -> None:
     global _issued_block_ids
     _issued_block_ids = (_issued_block_ids[0] + 1, tuple(block_ids or ()))
@@ -321,6 +327,16 @@ def publish_issued_block_ids(block_ids: list[int] | None) -> None:
 def get_issued_block_ids() -> tuple[int, tuple[int, ...]]:
     """(step id, block ids issued fresh for the step now being executed)."""
     return _issued_block_ids
+
+
+def set_kernel_blocks_per_block(mapping: dict[tuple[str, ...], int]) -> None:
+    _kernel_blocks_per_block.clear()
+    _kernel_blocks_per_block.update(mapping)
+
+
+def get_kernel_blocks_per_block(group_key: tuple[str, ...]) -> int | None:
+    """Kernel blocks per KV cache block for the group with these layer names."""
+    return _kernel_blocks_per_block.get(group_key)
 
 
 def select_common_block_size(
