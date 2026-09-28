@@ -48,10 +48,15 @@ class RecoverSSMState:
         if isinstance(num_sampled, int) or step is None:
             return
 
+        postprocessed = False
         for metadata in step:
             postprocess_meta = metadata.commit_recoverssm_state(num_sampled)
-            if postprocess_meta is None:
+            # The align postprocess writes per-request runner state from inputs
+            # shared by every recurrent group (same batch, spec split, block
+            # size and table width), so one launch per step covers all groups.
+            if postprocess_meta is None or postprocessed:
                 continue
+            postprocessed = True
             assert state_indices is not None
             # RecoverSSM already restored the accepted state. Update its running
             # column and reset the next-step copy bias to the neutral value.

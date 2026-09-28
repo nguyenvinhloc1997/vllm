@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -104,6 +104,45 @@ def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
     )
 
     metadata.commit_recoverssm_state.assert_called_once_with(num_sampled)
+
+
+def test_recoverssm_align_postprocess_launches_once_per_step(monkeypatch) -> None:
+    from vllm.v1.worker.gpu.model_states import recoverssm as recoverssm_mod
+
+    fake_kernel = MagicMock()
+    monkeypatch.setattr(
+        recoverssm_mod, "_postprocess_recoverssm_align_kernel", fake_kernel
+    )
+
+    postprocess_meta = RecoverSSMPostprocessMetadata(
+        num_spec_decodes=1,
+        request_indices=None,
+        num_computed_tokens=torch.tensor([6], dtype=torch.int32),
+        block_size=8,
+        block_table=torch.zeros((1, 4), dtype=torch.int32),
+    )
+    metadatas = []
+    for _ in range(3):
+        metadata = Mock(spec=RecoverSSMMetadata)
+        metadata.commit_recoverssm_state.return_value = postprocess_meta
+        metadatas.append(metadata)
+    groups = [[SimpleNamespace(layer_names=[f"layer{i}"])] for i in range(3)]
+    num_sampled = torch.tensor([2], dtype=torch.int32)
+
+    state = RecoverSSMState()
+    state.record_step(
+        {f"layer{i}": m for i, m in enumerate(metadatas)}, groups, for_capture=False
+    )
+    state.commit_step(
+        num_sampled,
+        torch.tensor([0], dtype=torch.int32),
+        state_indices=torch.zeros(1, dtype=torch.int32),
+        num_accepted_tokens=torch.ones(1, dtype=torch.int32),
+    )
+
+    for metadata in metadatas:
+        metadata.commit_recoverssm_state.assert_called_once_with(num_sampled)
+    fake_kernel.__getitem__.return_value.assert_called_once()
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
