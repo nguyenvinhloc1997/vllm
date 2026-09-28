@@ -47,6 +47,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
+    MambaStateCopyFuncsByType,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
@@ -62,6 +63,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
 )
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from .interfaces import (
     HasInnerState,
@@ -397,6 +399,7 @@ class Qwen3_5ForCausalLMBase(
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
+        self._use_gdn_recoverssm = vllm_config.cache_config.use_gdn_recoverssm
         self.model = Qwen3_5Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -493,6 +496,17 @@ class Qwen3_5ForCausalLMBase(
         cls,
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+    def get_mamba_state_copy_funcs(  # type: ignore[override]
+        self, mamba_types: set[MambaAttentionBackendEnum]
+    ) -> MambaStateCopyFuncsByType:
+        # Instance-level so the RecoverSSM page (5 states) gets 5 copy funcs.
+        funcs = (
+            MambaStateCopyFuncCalculator.gated_delta_net_recoverssm_state_copy_func()
+            if getattr(self, "_use_gdn_recoverssm", False)
+            else type(self).get_mamba_state_copy_func()
+        )
+        return {mamba_type: funcs for mamba_type in mamba_types}
 
     def compute_logits(
         self,
@@ -602,6 +616,7 @@ class Qwen3_5ForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+        self._use_gdn_recoverssm = vllm_config.cache_config.use_gdn_recoverssm
 
     def embed_input_ids(
         self,
@@ -729,6 +744,17 @@ class Qwen3_5ForConditionalGeneration(
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+    def get_mamba_state_copy_funcs(  # type: ignore[override]
+        self, mamba_types: set[MambaAttentionBackendEnum]
+    ) -> MambaStateCopyFuncsByType:
+        # Instance-level so the RecoverSSM page (5 states) gets 5 copy funcs.
+        funcs = (
+            MambaStateCopyFuncCalculator.gated_delta_net_recoverssm_state_copy_func()
+            if getattr(self, "_use_gdn_recoverssm", False)
+            else type(self).get_mamba_state_copy_func()
+        )
+        return {mamba_type: funcs for mamba_type in mamba_types}
 
 
 ########################################################
