@@ -164,6 +164,7 @@ from vllm.v1.worker.utils import (
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
+    publish_issued_block_ids,
 )
 from vllm.v1.worker.workspace import use_workspace_lane
 
@@ -1093,6 +1094,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        # Publish every freshly issued block id (any group) before attention
+        # metadata is built, so block-id keyed backend state can drop it.
+        publish_issued_block_ids(scheduler_output.issued_block_ids)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.

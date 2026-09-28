@@ -194,6 +194,11 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        # Every block id handed out fresh by get_new_blocks (never prefix-cache
+        # hits), across all KV cache groups. Drained by the scheduler each step
+        # so worker-side caches keyed by block id (KVarN's fp16 pool) can drop
+        # state for ids that now belong to someone else.
+        self.issued_block_ids: list[int] = []
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -659,6 +664,7 @@ class BlockPool:
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        self.issued_block_ids.extend(block.block_id for block in ret)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -675,6 +681,11 @@ class BlockPool:
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
+
+    def take_issued_block_ids(self) -> list[int]:
+        """Drain the block ids issued fresh since the last call."""
+        ids, self.issued_block_ids = self.issued_block_ids, []
+        return ids
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """

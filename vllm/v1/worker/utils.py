@@ -307,6 +307,22 @@ class AttentionGroup:
         self.get_metadata_builder().update_draft_decode_metadata(metadata)
 
 
+# Block ids issued fresh by the scheduler for the step being executed, with a
+# monotonically increasing step id so a consumer that runs more than once per
+# step (one metadata builder per KV cache group) acts once per step.
+_issued_block_ids: tuple[int, tuple[int, ...]] = (0, ())
+
+
+def publish_issued_block_ids(block_ids: list[int] | None) -> None:
+    global _issued_block_ids
+    _issued_block_ids = (_issued_block_ids[0] + 1, tuple(block_ids or ()))
+
+
+def get_issued_block_ids() -> tuple[int, tuple[int, ...]]:
+    """(step id, block ids issued fresh for the step now being executed)."""
+    return _issued_block_ids
+
+
 def select_common_block_size(
     kv_manager_block_size: int,
     backends: list[type[AttentionBackend]],

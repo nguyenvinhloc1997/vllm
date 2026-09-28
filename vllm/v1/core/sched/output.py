@@ -284,6 +284,11 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+    # Every block id issued fresh from the pool this step, in any KV cache group
+    # (not prefix-cache hits). A previous owner's worker-side state keyed by
+    # these ids (e.g. KVarN's fp16 sink/tail pool) is stale and must be dropped
+    # without being written back into the block.
+    issued_block_ids: list[int] | None = None
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
