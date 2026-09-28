@@ -1231,6 +1231,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                    head_dim); mutated in-place.
             core_attn_out: Pre-allocated output buffer for attention results.
         """
+        if self.cache_config.use_gdn_recoverssm:
+            raise NotImplementedError("GDN RecoverSSM is CUDA-only")
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
 
@@ -1497,6 +1499,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_indices=spec_state_indices_tensor,
                 num_accepted_tokens=num_accepted_tokens,
                 use_qk_l2norm_in_kernel=True,
+                recoverssm_records=(
+                    (self_kv_cache[2], self_kv_cache[3], self_kv_cache[4])
+                    if self.cache_config.use_gdn_recoverssm
+                    else None
+                ),
             )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
@@ -1851,8 +1858,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self, attn_metadata: GDNAttentionMetadata
     ) -> bool:
         state_indices = attn_metadata.spec_state_indices_tensor
+        # The fused CUDA MTP kernel has no RecoverSSM record mode.
         return (
-            attn_metadata.spec_sequence_masks is not None
+            not self.cache_config.use_gdn_recoverssm
+            and attn_metadata.spec_sequence_masks is not None
             and attn_metadata.num_decodes == 0
             and attn_metadata.num_spec_decodes > 0
             and self.kv_cache[1].dtype in FUSED_GDN_STATE_DTYPES
