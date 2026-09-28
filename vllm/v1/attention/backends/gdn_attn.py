@@ -301,6 +301,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         ):
             block_table_tensor = self.mamba_aligned_state_indices[: m.num_reqs]
         else:
+            if (
+                self.use_recoverssm
+                and self.vllm_config.cache_config.mamba_cache_mode == "align"
+            ):
+                assert not self.vllm_config.use_v2_model_runner, (
+                    "GDN RecoverSSM align mode needs precomputed aligned Mamba "
+                    "state indices on the V2 model runner"
+                )
             block_table_tensor = mamba_get_block_table_tensor(
                 m.block_table_tensor,
                 m.seq_lens,
