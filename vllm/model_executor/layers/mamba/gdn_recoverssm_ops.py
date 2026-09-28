@@ -14,9 +14,9 @@ from vllm.triton_utils import tl, triton
 
 @triton.jit
 def _gdn_rank1(b_h, b_c, b_k):
-    # Explicit fma: with `b_h + b_c * b_k` LLVM contracts whichever product has
-    # fewer uses, so `b_h * decay` (multi-use in verify, single-use in commit)
-    # would round differently on the two sides.
+    # Explicit fma: verify and commit round identically. Versus pre-RecoverSSM:
+    # plain bitwise identical, DAMP fp16 hi ±1-2 ulp deterministic (below int8).
+    # Do not change to `b_h + b_c * b_k` — breaks commit exactness.
     return tl.fma(b_c[:, None], b_k[None, :], b_h)
 
 
