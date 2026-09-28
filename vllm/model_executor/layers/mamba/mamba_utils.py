@@ -163,6 +163,14 @@ class MambaStateDtypeCalculator:
         activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
         return (*base_dtypes, torch.float32, activation_dtype)
 
+    @classmethod
+    def append_gdn_recoverssm_record(
+        cls, base_dtypes: tuple[torch.dtype, ...]
+    ) -> tuple[torch.dtype, ...]:
+        # correction, normalized key, decay: all fp32 so the commit replays
+        # exactly the operands the verify kernel used.
+        return (*base_dtypes, torch.float32, torch.float32, torch.float32)
+
 
 class MambaStateShapeCalculator:
     @classmethod
@@ -350,6 +358,24 @@ class MambaStateShapeCalculator:
             *base_shapes,
             (local_num_heads, spec_query_len, head_dim),
             (local_num_heads, spec_query_len, 2 * head_dim),
+        )
+
+    @classmethod
+    def append_gdn_recoverssm_record(
+        cls,
+        base_shapes: tuple[tuple[int, ...], ...],
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        tp_world_size: int,
+        spec_query_len: int,
+    ) -> tuple[tuple[int, ...], ...]:
+        hv = divide(num_v_heads, tp_world_size)
+        return (
+            *base_shapes,
+            (hv, spec_query_len, head_v_dim),
+            (hv, spec_query_len, head_k_dim),
+            (hv, spec_query_len),
         )
 
 

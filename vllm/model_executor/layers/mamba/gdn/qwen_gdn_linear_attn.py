@@ -29,8 +29,6 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.damp_gdn_update import damp_fused_update
 from vllm.model_executor.layers.mamba.damp_runtime import (
     damp_commit,
@@ -39,6 +37,8 @@ from vllm.model_executor.layers.mamba.damp_runtime import (
     damp_write_rows,
     kernel_dtype,
 )
+from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
@@ -378,8 +378,8 @@ class ChunkGatedDeltaRule(CustomOp):
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_shape(
         self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+    ) -> tuple[tuple[int, ...], ...]:
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
             self.num_k_heads,
             self.num_v_heads,
@@ -388,6 +388,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv_kernel_size,
             self.num_spec,
         )
+        if self.cache_config.use_gdn_recoverssm:
+            shapes = MambaStateShapeCalculator.append_gdn_recoverssm_record(
+                shapes,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                self.tp_size,
+                spec_query_len=1 + self.num_spec,
+            )
+        return shapes
 
     def __init__(
         self,
