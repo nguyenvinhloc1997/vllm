@@ -9,7 +9,10 @@
 
 import torch
 
-from vllm.model_executor.layers.mamba.gdn_recoverssm_ops import _gdn_rank1
+from vllm.model_executor.layers.mamba.gdn_recoverssm_ops import (
+    _gdn_rank1,
+    check_recoverssm_records,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -162,15 +165,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             tl.store(
                 rec_c + state_idx * stride_rec_c + (i_hv * REC_S + i_t) * V + o_v,
                 b_v,
-                mask=mask_v,
+                mask=mask_v & (i_t < REC_S),
             )
             if i_v == 0:
                 tl.store(
                     rec_k + state_idx * stride_rec_k + (i_hv * REC_S + i_t) * K + o_k,
                     b_k,
-                    mask=mask_k,
+                    mask=mask_k & (i_t < REC_S),
                 )
-                tl.store(rec_d + state_idx * stride_rec_d + i_hv * REC_S + i_t, b_decay)
+                tl.store(
+                    rec_d + state_idx * stride_rec_d + i_hv * REC_S + i_t,
+                    b_decay,
+                    mask=i_t < REC_S,
+                )
         # [BV, BK]
         b_h = _gdn_rank1(b_h, b_v, b_k)
         # [BV]
@@ -269,6 +276,7 @@ def fused_sigmoid_gating_delta_rule_update(
             raise ValueError("GDN RecoverSSM records are for scalar-gate GDN")
         # Record stores index by the loaded checkpoint `state_idx`.
         assert initial_state is not None and ssm_state_indices is not None
+        check_recoverssm_records(ssm_state_indices, recoverssm_records)
         rec_c, rec_k, rec_d = recoverssm_records
         assert rec_c.stride()[1:] == (rec_c.shape[2] * V, V, 1)
         assert rec_k.stride()[1:] == (rec_k.shape[2] * K, K, 1)

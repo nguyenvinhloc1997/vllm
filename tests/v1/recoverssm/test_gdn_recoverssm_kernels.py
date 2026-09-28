@@ -5,6 +5,9 @@
 import pytest
 import torch
 
+from vllm.model_executor.layers.mamba import damp_runtime
+from vllm.model_executor.layers.mamba.damp_gdn_update import damp_fused_update
+from vllm.model_executor.layers.mamba.damp_pack import page_bytes
 from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -85,4 +88,74 @@ def test_plain_record_mode_output_bitwise(dtype):
     assert torch.equal(o_rec, o_base)
     assert torch.equal(rec_state, state0)  # record mode never stores state
     assert rec[0][rec_idx.flatten().long()].abs().sum() > 0
+    assert rec[1][rec_idx.flatten().long()].abs().sum() > 0
     assert rec[2][rec_idx.flatten().long()].abs().sum() > 0
+
+
+N_HI = 32
+
+
+@pytest.fixture
+def damp_env(tmp_path, monkeypatch):
+    g = torch.Generator().manual_seed(7)
+    mask = torch.zeros(HV, K, dtype=torch.bool)
+    for h in range(HV):
+        mask[h, torch.randperm(K, generator=g)[:N_HI]] = True
+    path = tmp_path / "mask.pt"
+    torch.save(mask, path)
+    monkeypatch.setenv("VLLM_DAMP_STATE", "mixed")
+    monkeypatch.setenv("DAMP_MASK", str(path))
+    monkeypatch.setattr(damp_runtime, "_hi_idx", None)
+    monkeypatch.setattr(damp_runtime, "_lo_idx", None)
+    yield
+
+
+def _damp_page(num_blocks: int, seed: int) -> torch.Tensor:
+    page = torch.zeros(
+        num_blocks, page_bytes(N_HI, K - N_HI), dtype=torch.uint8, device=DEV
+    )
+    damp_runtime._ensure(page.device, HV)
+    hi, lo, sc = damp_runtime._views(page)
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    hi.copy_((torch.randn(hi.shape, generator=g, device=DEV) * 0.1).half())
+    lo.copy_(torch.randint(-127, 128, lo.shape, generator=g, device=DEV).to(torch.int8))
+    sc.copy_(torch.rand(sc.shape, generator=g, device=DEV) * 1e-3 + 1e-4)
+    page[0] = 0
+    return page
+
+
+def _damp_baseline_and_record(n_req, seed):
+    inp = _inputs(n_req, seed)
+    num_blocks = 1 + n_req * S
+    page0 = _damp_page(num_blocks, seed + 1)
+    base_page = page0.clone()
+    base_idx = torch.arange(1, num_blocks, device=DEV, dtype=torch.int32).view(n_req, S)
+    ones = torch.ones(n_req, device=DEV, dtype=torch.int32)
+    o_base, _ = damp_fused_update(
+        initial_state=base_page,
+        ssm_state_indices=base_idx,
+        num_accepted_tokens=ones,
+        use_qk_l2norm_in_kernel=True,
+        **inp,
+    )
+    rec_page = page0.clone()
+    rec = _records(num_blocks)
+    rec_idx = base_idx[:, :1].contiguous()
+    o_rec, _ = damp_fused_update(
+        initial_state=rec_page,
+        ssm_state_indices=rec_idx,
+        num_accepted_tokens=ones,
+        use_qk_l2norm_in_kernel=True,
+        recoverssm_records=rec,
+        **inp,
+    )
+    return page0, base_page, base_idx, o_base, rec_page, rec, rec_idx, o_rec
+
+
+def test_damp_record_mode_output_bitwise(damp_env):
+    page0, _, _, o_base, rec_page, rec, rec_idx, o_rec = _damp_baseline_and_record(
+        n_req=2, seed=3
+    )
+    assert torch.equal(o_rec, o_base)
+    assert torch.equal(rec_page, page0)
+    assert rec[1][rec_idx.flatten().long()].abs().sum() > 0
