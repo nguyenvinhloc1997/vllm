@@ -460,5 +460,17 @@ class MambaStateCopyFuncCalculator:
         return (get_conv_copy_spec, get_temporal_copy_spec)
 
     @classmethod
+    def gated_delta_net_recoverssm_state_copy_func(cls):
+        # RecoverSSM records (correction, key, decay) are per-step scratch; a
+        # whole-block copy keeps the align copier's one-func-per-state contract.
+        return (
+            get_conv_copy_spec,
+            get_temporal_copy_spec,
+            get_temporal_copy_spec,
+            get_temporal_copy_spec,
+            get_temporal_copy_spec,
+        )
+
+    @classmethod
     def kda_state_copy_func(cls):
         return (get_conv_copy_spec, get_temporal_copy_spec)
