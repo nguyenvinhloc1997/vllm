@@ -316,10 +316,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
             if self.use_recoverssm:
                 # Zero-draft decodes stay on the spec path to keep the
-                # extended conv window (as Kimi RecoverSSM does).
+                # extended conv window (as Kimi RecoverSSM does). Rows longer
+                # than one window (dummy/capture batches) take the prefill path.
                 assert m.is_prefilling is not None
-                spec_sequence_masks_cpu |= (~m.is_prefilling.cpu()) & (
-                    query_start_loc_cpu.diff() > 0
+                row_lens_cpu = query_start_loc_cpu.diff()
+                spec_sequence_masks_cpu |= (
+                    (~m.is_prefilling.cpu())
+                    & (row_lens_cpu > 0)
+                    & (row_lens_cpu <= self.num_spec + 1)
                 )
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
             if num_spec_decodes == 0 or (

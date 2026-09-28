@@ -280,3 +280,15 @@ def test_recoverssm_full_cudagraph_commit_uses_single_slot(monkeypatch):
     assert state_indices.shape == (2,)
     assert qsl.tolist() == [0, 4, 5]
     assert kw["block_table"] is None and kw["request_indices"] is None
+
+
+def test_recoverssm_oversize_row_takes_prefill_path(monkeypatch):
+    # Dummy/capture batches: not prefilling, draft count -1, query_len > S.
+    builder = _create_recoverssm_builder(3)
+    monkeypatch.setattr(builder, "_get_recoverssm_context", lambda: object())
+    batch = BatchSpec(seq_lens=[80, 96], query_lens=[4, 20])
+    meta = _build(builder, batch, num_decode_draft_tokens=[3, -1])
+    assert meta.num_spec_decodes == 1
+    assert meta.spec_sequence_masks.cpu().tolist() == [True, False]
+    assert meta.num_prefills == 1
+    assert meta.num_prefill_tokens == 20
