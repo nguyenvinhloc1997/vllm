@@ -14,7 +14,10 @@ from vllm.triton_utils import tl, triton
 
 @triton.jit
 def _gdn_rank1(b_h, b_c, b_k):
-    return b_h + b_c[:, None] * b_k[None, :]
+    # Explicit fma: with `b_h + b_c * b_k` LLVM contracts whichever product has
+    # fewer uses, so `b_h * decay` (multi-use in verify, single-use in commit)
+    # would round differently on the two sides.
+    return tl.fma(b_c[:, None], b_k[None, :], b_h)
 
 
 @triton.jit
@@ -27,7 +30,9 @@ def _damp_quantize(b_lo):
     return codes, sc
 
 
-def check_recoverssm_records(ssm_state_indices, records) -> None:
+def check_recoverssm_records(
+    ssm_state_indices, records, num_heads: int, key_dim: int, value_dim: int
+) -> None:
     """Host-side record-mode preconditions (shapes and dtypes only, no sync)."""
     if ssm_state_indices.ndim != 2 or ssm_state_indices.shape[1] != 1:
         raise ValueError(
@@ -42,4 +47,14 @@ def check_recoverssm_records(ssm_state_indices, records) -> None:
         raise ValueError(
             "RecoverSSM records disagree on S: "
             f"rec_c {rec_c.shape[2]}, rec_k {rec_k.shape[2]}, rec_d {rec_d.shape[2]}"
+        )
+    if not rec_c.shape[1] == rec_k.shape[1] == rec_d.shape[1] == num_heads:
+        raise ValueError(
+            f"RecoverSSM records need {num_heads} value heads: rec_c "
+            f"{rec_c.shape[1]}, rec_k {rec_k.shape[1]}, rec_d {rec_d.shape[1]}"
+        )
+    if rec_c.shape[3] != value_dim or rec_k.shape[3] != key_dim:
+        raise ValueError(
+            f"RecoverSSM records need V={value_dim}, K={key_dim}: "
+            f"rec_c {rec_c.shape[3]}, rec_k {rec_k.shape[3]}"
         )

@@ -276,7 +276,7 @@ def fused_sigmoid_gating_delta_rule_update(
             raise ValueError("GDN RecoverSSM records are for scalar-gate GDN")
         # Record stores index by the loaded checkpoint `state_idx`.
         assert initial_state is not None and ssm_state_indices is not None
-        check_recoverssm_records(ssm_state_indices, recoverssm_records)
+        check_recoverssm_records(ssm_state_indices, recoverssm_records, HV, K, V)
         rec_c, rec_k, rec_d = recoverssm_records
         assert rec_c.stride()[1:] == (rec_c.shape[2] * V, V, 1)
         assert rec_k.stride()[1:] == (rec_k.shape[2] * K, K, 1)

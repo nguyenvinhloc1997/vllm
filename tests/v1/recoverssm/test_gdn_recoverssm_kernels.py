@@ -159,3 +159,114 @@ def test_damp_record_mode_output_bitwise(damp_env):
     assert torch.equal(o_rec, o_base)
     assert torch.equal(rec_page, page0)
     assert rec[1][rec_idx.flatten().long()].abs().sum() > 0
+
+
+from types import SimpleNamespace  # noqa: E402
+
+from vllm.model_executor.layers.mamba.gdn_recoverssm import (  # noqa: E402
+    GDNRecoverSSMCommitContext,
+)
+from vllm.model_executor.layers.mamba.gdn_recoverssm_ops import (  # noqa: E402
+    check_recoverssm_records,
+)
+from vllm.model_executor.layers.mamba.mamba_utils import (  # noqa: E402
+    is_conv_state_dim_first,
+)
+
+CONV_DIM, CONV_LEN = 64, 3 + (S - 1)
+
+
+def test_check_records_rejects_head_and_dim_mismatch():
+    idx = torch.zeros(2, 1, dtype=torch.int32)
+    ok = tuple(t.cpu() for t in _records(3))
+    check_recoverssm_records(idx, ok, HV, K, V)
+    for bad in (
+        (ok[0][:, :-1], ok[1], ok[2]),
+        (ok[0], ok[1][:, :-1], ok[2]),
+        (ok[0], ok[1], ok[2][:, :-1]),
+        (ok[0][..., :-1], ok[1], ok[2]),
+        (ok[0], ok[1][..., :-1], ok[2]),
+    ):
+        with pytest.raises(ValueError):
+            check_recoverssm_records(idx, bad, HV, K, V)
+
+
+def _conv(num_blocks, seed):
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    c = torch.randn(num_blocks, CONV_DIM, CONV_LEN, generator=g, device=DEV).bfloat16()
+    return c if is_conv_state_dim_first() else c.transpose(-1, -2).contiguous()
+
+
+def _commit(state, rec, conv, rec_idx, n_acc, **align):
+    layer = SimpleNamespace(kv_cache=(conv, state, *rec))
+    ctx = GDNRecoverSSMCommitContext.create([layer], spec_query_len=S, max_num_reqs=8)
+    n = rec_idx.shape[0]
+    ctx.commit(
+        torch.full((n,), n_acc, device=DEV, dtype=torch.int32),
+        rec_idx[:, 0],
+        torch.arange(0, n * S + 1, S, device=DEV, dtype=torch.int32),
+        **align,
+    )
+
+
+def _max_diff(got, want):
+    if got.dtype == torch.uint8:  # DAMP page: report the byte mismatch count
+        return f"{(got != want).sum().item()} bytes differ"
+    return f"max |diff| {(got.float() - want.float()).abs().max().item():.3e}"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("n_acc", range(0, S + 1))
+def test_plain_commit_matches_baseline_slot(dtype, n_acc):
+    state0, base_state, base_idx, _, rec_state, rec, rec_idx, _ = (
+        _plain_baseline_and_record(n_req=2, seed=11, dtype=dtype)
+    )
+    _commit(rec_state, rec, _conv(rec_state.shape[0], 5), rec_idx, n_acc)
+    for r in range(2):
+        got = rec_state[rec_idx[r, 0]]
+        want = (
+            state0[rec_idx[r, 0]] if n_acc == 0 else base_state[base_idx[r, n_acc - 1]]
+        )
+        assert torch.equal(got, want), f"req {r} n_acc {n_acc}: {_max_diff(got, want)}"
+
+
+@pytest.mark.parametrize("n_acc", range(0, S + 1))
+def test_damp_commit_matches_baseline_slot(damp_env, n_acc):
+    page0, base_page, base_idx, _, rec_page, rec, rec_idx, _ = (
+        _damp_baseline_and_record(n_req=2, seed=13)
+    )
+    _commit(rec_page, rec, _conv(rec_page.shape[0], 6), rec_idx, n_acc)
+    for r in range(2):
+        got = rec_page[rec_idx[r, 0]]
+        want = page0[rec_idx[r, 0]] if n_acc == 0 else base_page[base_idx[r, n_acc - 1]]
+        assert torch.equal(got, want), f"req {r} n_acc {n_acc}: {_max_diff(got, want)}"
+
+
+@pytest.mark.parametrize("fmt", ["plain", "damp"])
+def test_align_boundary_and_final(request, fmt):
+    # block 16, 12 tokens computed, 6 accepted: boundary after 4 tokens.
+    if fmt == "damp":
+        request.getfixturevalue("damp_env")
+        s0, base, base_idx, _, st, rec, rec_idx, _ = _damp_baseline_and_record(2, 17)
+    else:
+        s0, base, base_idx, _, st, rec, rec_idx, _ = _plain_baseline_and_record(
+            2, 17, torch.float16
+        )
+    num_blocks = st.shape[0]
+    extra = torch.arange(num_blocks, num_blocks + 2, device=DEV, dtype=torch.int32)
+    st = torch.cat([st, torch.zeros_like(st[:2])])
+    rec = tuple(torch.cat([t, torch.zeros_like(t[:2])]) for t in rec)
+    block_table = torch.stack([rec_idx[:, 0], extra], dim=1).contiguous()
+    _commit(
+        st,
+        rec,
+        _conv(st.shape[0], 8),
+        rec_idx,
+        6,
+        block_table=block_table,
+        num_computed_tokens=torch.full((2,), 12, device=DEV, dtype=torch.int32),
+        mamba_block_size=16,
+    )
+    for r in range(2):
+        assert torch.equal(st[block_table[r, 0]], base[base_idx[r, 3]])  # boundary
+        assert torch.equal(st[block_table[r, 1]], base[base_idx[r, 5]])  # final

@@ -299,7 +299,7 @@ def damp_fused_update(
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
     if recoverssm_records is not None:
         # Record stores index by the loaded checkpoint `state_idx`.
-        check_recoverssm_records(ssm_state_indices, recoverssm_records)
+        check_recoverssm_records(ssm_state_indices, recoverssm_records, HV, K, V)
         rec_c, rec_k, rec_d = recoverssm_records
         assert rec_c.stride()[1:] == (rec_c.shape[2] * V, V, 1)
         assert rec_k.stride()[1:] == (rec_k.shape[2] * K, K, 1)
