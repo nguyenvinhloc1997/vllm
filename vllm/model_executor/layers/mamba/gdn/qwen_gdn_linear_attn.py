@@ -1376,7 +1376,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                # RecoverSSM keeps one checkpoint slot ([N, 1]), but the conv
+                # window still spans all S = 1 + num_spec tokens.
+                max_query_len=(1 + self.num_spec)
+                if self.cache_config.use_gdn_recoverssm
+                else spec_state_indices_tensor.size(-1),
                 validate_data=False,
             )
 
