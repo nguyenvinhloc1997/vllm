@@ -175,3 +175,37 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias() -
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
     expected_accepted = [9, 1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_recoverssm_align_state_column_at_exact_block_boundary() -> None:
+    """After n tokens the running state lives in column (n - 1) // block_size.
+
+    5 computed + 3 accepted = 8 = one full block: the state stays in column 0.
+    Column 1 is not allocated yet at that point (regression: n // block_size).
+    """
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = True
+    state._mamba_ctx = None
+    state._mamba_state_idx_gpu = torch.full((2,), -1, dtype=torch.int32, device="cuda")
+    state.recoverssm = RecoverSSMState()
+    state.num_accepted_tokens_gpu = torch.full(
+        (2,), 9, dtype=torch.int32, device="cuda"
+    )
+    metadata = Mock(spec=RecoverSSMMetadata)
+    metadata.commit_recoverssm_state.return_value = RecoverSSMPostprocessMetadata(
+        num_spec_decodes=1,
+        request_indices=None,
+        num_computed_tokens=torch.tensor([5], dtype=torch.int32, device="cuda"),
+        block_size=8,
+        block_table=torch.zeros((1, 4), dtype=torch.int32, device="cuda"),
+    )
+    num_sampled = torch.tensor([3], dtype=torch.int32, device="cuda")
+    idx_mapping = torch.tensor([0], dtype=torch.int32, device="cuda")
+    state.recoverssm.record_step(
+        {"layer": metadata},
+        [[SimpleNamespace(layer_names=["layer"])]],
+        for_capture=False,
+    )
+    state.postprocess_state(idx_mapping, num_sampled)
+    assert state._mamba_state_idx_gpu.tolist()[0] == 0
