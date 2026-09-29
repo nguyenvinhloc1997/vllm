@@ -20,6 +20,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
+    GDNRecoverSSMMetadata,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -158,6 +159,8 @@ def _build(
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
+    if getattr(builder, "use_recoverssm", False) and common.is_prefilling is None:
+        common.is_prefilling = torch.zeros(batch_spec.batch_size, dtype=torch.bool)
     kwargs: dict = {}
     if num_decode_draft_tokens is not None:
         kwargs["num_decode_draft_tokens_cpu"] = torch.tensor(
@@ -221,3 +224,98 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def _create_recoverssm_builder(
+    num_speculative_tokens: int = 3, full_cuda_graph: bool = False
+):
+    builder = _create_gdn_builder(num_speculative_tokens, full_cuda_graph)
+    builder.vllm_config.cache_config.use_gdn_recoverssm = True
+    # Re-init so the RecoverSSM branch allocates its tensors.
+    return GDNAttentionMetadataBuilder(
+        kv_cache_spec=builder.kv_cache_spec,
+        layer_names=["layer.0"],
+        vllm_config=builder.vllm_config,
+        device=DEVICE,
+    )
+
+
+def test_recoverssm_single_state_slot_and_unit_acceptance(monkeypatch):
+    builder = _create_recoverssm_builder(3)
+    monkeypatch.setattr(builder, "_get_recoverssm_context", lambda: object())
+    batch = BatchSpec(seq_lens=[80, 96], query_lens=[4, 2])
+    meta = _build(builder, batch, num_decode_draft_tokens=[3, 1])
+    assert isinstance(meta, GDNRecoverSSMMetadata)
+    assert meta.spec_state_indices_tensor.shape[1] == 1
+    assert torch.equal(meta.num_accepted_tokens, torch.ones(2, dtype=torch.int32))
+    assert meta.recoverssm_commit is not None
+
+
+def test_recoverssm_zero_draft_decode_stays_spec(monkeypatch):
+    builder = _create_recoverssm_builder(3)
+    monkeypatch.setattr(builder, "_get_recoverssm_context", lambda: object())
+    batch = BatchSpec(seq_lens=[80], query_lens=[1])
+    meta = _build(builder, batch, num_decode_draft_tokens=[0])
+    assert meta.num_spec_decodes == 1
+    assert meta.num_decodes == 0
+
+
+def test_recoverssm_full_cudagraph_commit_uses_single_slot(monkeypatch):
+    builder = _create_recoverssm_builder(3, full_cuda_graph=True)
+    calls = []
+
+    class _Ctx:
+        def commit(self, num_accepted, state_indices, query_start_loc, **kw):
+            calls.append((num_accepted, state_indices, query_start_loc, kw))
+
+    monkeypatch.setattr(builder, "_get_recoverssm_context", lambda: _Ctx())
+    batch = BatchSpec(seq_lens=[80, 96], query_lens=[4, 1])
+    meta = _build(builder, batch, num_decode_draft_tokens=[3, -1])
+    assert meta.num_spec_decodes == 2
+    assert meta.spec_state_indices_tensor.shape == (2, 1)
+    accepted = torch.tensor([2, 1], dtype=torch.int32)
+    assert meta.commit_recoverssm_state(accepted) is None  # "none" cache mode
+    (num_accepted, state_indices, qsl, kw) = calls[0]
+    assert num_accepted is accepted
+    assert state_indices.shape == (2,)
+    assert qsl.tolist() == [0, 4, 5]
+    assert kw["block_table"] is None and kw["request_indices"] is None
+
+
+def test_recoverssm_oversize_row_takes_prefill_path(monkeypatch):
+    # Dummy/capture batches: not prefilling, draft count -1, query_len > S.
+    builder = _create_recoverssm_builder(3)
+    monkeypatch.setattr(builder, "_get_recoverssm_context", lambda: object())
+    batch = BatchSpec(seq_lens=[80, 96], query_lens=[4, 20])
+    meta = _build(builder, batch, num_decode_draft_tokens=[3, -1])
+    assert meta.num_spec_decodes == 1
+    assert meta.spec_sequence_masks.cpu().tolist() == [True, False]
+    assert meta.num_prefills == 1
+    assert meta.num_prefill_tokens == 20
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA")
+def test_recoverssm_context_from_real_layer_caches():
+    """_get_recoverssm_context resolves layers by name and validates their pages."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+
+    builder = _create_recoverssm_builder(3)
+    s, hv, k, blocks, dev = 4, 48, 128, 3, "cuda"
+    conv = torch.zeros(blocks, 64, 3 + 3, dtype=torch.bfloat16, device=dev)
+    if not is_conv_state_dim_first():
+        conv = conv.transpose(-1, -2).contiguous()
+    page = (
+        conv,
+        torch.zeros(blocks, hv, k, k, dtype=torch.float16, device=dev),
+        torch.zeros(blocks, hv, s, k, dtype=torch.float32, device=dev),
+        torch.zeros(blocks, hv, s, k, dtype=torch.float32, device=dev),
+        torch.zeros(blocks, hv, s, dtype=torch.float32, device=dev),
+    )
+    builder.vllm_config.compilation_config.static_forward_context["layer.0"] = (
+        SimpleNamespace(kv_cache=page)
+    )
+    ctx = builder._get_recoverssm_context()
+    assert ctx is builder._get_recoverssm_context()  # cached
+    assert ctx.spec_query_len == s and not ctx.damp

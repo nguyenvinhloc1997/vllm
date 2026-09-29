@@ -29,8 +29,8 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from vllm.compilation.decorators import support_torch_compile
 import vllm.envs as envs
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -47,6 +47,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
+    MambaStateCopyFuncsByType,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
@@ -62,6 +63,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
 )
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from .interfaces import (
     HasInnerState,
@@ -72,10 +74,11 @@ from .interfaces import (
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsReplaySSM,
     _require_is_multimodal,
 )
-from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from .ngm_residual import NgramResidual, parse_layer_ids, update_input_ids
+from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from .qwen3_next import (
     Qwen3NextAttention,
     Qwen3NextDecoderLayer,
@@ -298,9 +301,7 @@ class Qwen3_5Model(Qwen3NextModel):
         self._ngm_ids: torch.Tensor | None = None
         self._ngm_enabled = False
         if envs.VLLM_NGM:
-            layer_ids = parse_layer_ids(
-                envs.VLLM_NGM_LAYERS, config.num_hidden_layers
-            )
+            layer_ids = parse_layer_ids(envs.VLLM_NGM_LAYERS, config.num_hidden_layers)
             memory = NgramResidual(
                 self.embed_tokens,
                 embedding_dim=config.hidden_size,
@@ -355,6 +356,7 @@ class Qwen3_5ForCausalLMBase(
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsReplaySSM,
 ):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -397,6 +399,7 @@ class Qwen3_5ForCausalLMBase(
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
+        self._use_gdn_recoverssm = vllm_config.cache_config.use_gdn_recoverssm
         self.model = Qwen3_5Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -446,17 +449,20 @@ class Qwen3_5ForCausalLMBase(
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: "VllmConfig",
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+    ) -> tuple[torch.dtype, ...]:
+        dtypes = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
+        if vllm_config.cache_config.use_gdn_recoverssm:
+            dtypes = MambaStateDtypeCalculator.append_gdn_recoverssm_record(dtypes)
+        return dtypes
 
     @classmethod
     def get_mamba_state_shape_from_config(
         cls, vllm_config: "VllmConfig"
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> tuple[tuple[int, ...], ...]:
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_text_config
         tp_size = parallel_config.tensor_parallel_size
@@ -465,7 +471,7 @@ class Qwen3_5ForCausalLMBase(
             if vllm_config.speculative_config
             else 0
         )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,
             hf_config.linear_num_value_heads,
@@ -474,12 +480,33 @@ class Qwen3_5ForCausalLMBase(
             hf_config.linear_conv_kernel_dim,
             num_spec,
         )
+        if vllm_config.cache_config.use_gdn_recoverssm:
+            shapes = MambaStateShapeCalculator.append_gdn_recoverssm_record(
+                shapes,
+                hf_config.linear_num_value_heads,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
+                tp_size,
+                spec_query_len=1 + num_spec,
+            )
+        return shapes
 
     @classmethod
     def get_mamba_state_copy_func(
         cls,
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+    def get_mamba_state_copy_funcs(  # type: ignore[override]
+        self, mamba_types: set[MambaAttentionBackendEnum]
+    ) -> MambaStateCopyFuncsByType:
+        # Instance-level so the RecoverSSM page (5 states) gets 5 copy funcs.
+        funcs = (
+            MambaStateCopyFuncCalculator.gated_delta_net_recoverssm_state_copy_func()
+            if getattr(self, "_use_gdn_recoverssm", False)
+            else type(self).get_mamba_state_copy_func()
+        )
+        return {mamba_type: funcs for mamba_type in mamba_types}
 
     def compute_logits(
         self,
@@ -511,6 +538,9 @@ class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
+    # RecoverSSM is only wired and tested for the dense Qwen3.5 GDN models.
+    supports_replayssm = False  # type: ignore[misc]
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
@@ -528,7 +558,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
     info=Qwen3_5ProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
-class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
+class Qwen3_5ForConditionalGeneration(
+    Qwen3VLForConditionalGeneration, IsHybrid, SupportsReplaySSM
+):
     supports_multimodal_pruning = True
 
     hf_to_vllm_mapper = (
@@ -584,6 +616,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+        self._use_gdn_recoverssm = vllm_config.cache_config.use_gdn_recoverssm
 
     def embed_input_ids(
         self,
@@ -666,17 +699,20 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: "VllmConfig",
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+    ) -> tuple[torch.dtype, ...]:
+        dtypes = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
+        if vllm_config.cache_config.use_gdn_recoverssm:
+            dtypes = MambaStateDtypeCalculator.append_gdn_recoverssm_record(dtypes)
+        return dtypes
 
     @classmethod
     def get_mamba_state_shape_from_config(
         cls, vllm_config: "VllmConfig"
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> tuple[tuple[int, ...], ...]:
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_text_config
         tp_size = parallel_config.tensor_parallel_size
@@ -685,7 +721,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             if vllm_config.speculative_config
             else 0
         )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,
             hf_config.linear_num_value_heads,
@@ -694,10 +730,31 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             hf_config.linear_conv_kernel_dim,
             num_spec,
         )
+        if vllm_config.cache_config.use_gdn_recoverssm:
+            shapes = MambaStateShapeCalculator.append_gdn_recoverssm_record(
+                shapes,
+                hf_config.linear_num_value_heads,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
+                tp_size,
+                spec_query_len=1 + num_spec,
+            )
+        return shapes
 
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+    def get_mamba_state_copy_funcs(  # type: ignore[override]
+        self, mamba_types: set[MambaAttentionBackendEnum]
+    ) -> MambaStateCopyFuncsByType:
+        # Instance-level so the RecoverSSM page (5 states) gets 5 copy funcs.
+        funcs = (
+            MambaStateCopyFuncCalculator.gated_delta_net_recoverssm_state_copy_func()
+            if getattr(self, "_use_gdn_recoverssm", False)
+            else type(self).get_mamba_state_copy_func()
+        )
+        return {mamba_type: funcs for mamba_type in mamba_types}
 
 
 ########################################################
@@ -757,6 +814,8 @@ class Qwen3_5_MoeMixtureOfExperts(MixtureOfExperts):
 class Qwen3_5MoeForConditionalGeneration(
     Qwen3_5ForConditionalGeneration, Qwen3_5_MoeMixtureOfExperts
 ):
+    # RecoverSSM is only wired and tested for the dense Qwen3.5 GDN models.
+    supports_replayssm = False  # type: ignore[misc]
     # For MoE LoRA weights loading
     is_3d_moe_weight: bool = True
 

@@ -29,8 +29,6 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.damp_gdn_update import damp_fused_update
 from vllm.model_executor.layers.mamba.damp_runtime import (
     damp_commit,
@@ -39,6 +37,8 @@ from vllm.model_executor.layers.mamba.damp_runtime import (
     damp_write_rows,
     kernel_dtype,
 )
+from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
@@ -378,8 +378,8 @@ class ChunkGatedDeltaRule(CustomOp):
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_shape(
         self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+    ) -> tuple[tuple[int, ...], ...]:
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
             self.num_k_heads,
             self.num_v_heads,
@@ -388,6 +388,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv_kernel_size,
             self.num_spec,
         )
+        if self.cache_config.use_gdn_recoverssm:
+            shapes = MambaStateShapeCalculator.append_gdn_recoverssm_record(
+                shapes,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                self.tp_size,
+                spec_query_len=1 + self.num_spec,
+            )
+        return shapes
 
     def __init__(
         self,
@@ -543,7 +553,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
     ) -> str | None:
-        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
+        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]
         if (
             self.gqa_interleaved_layout
             or self.head_k_dim != 128
@@ -1113,7 +1123,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         dtype = qkv_or_qkvz.dtype
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
-        _, state_dtype = self.get_state_dtype()
+        _, state_dtype = self.get_state_dtype()[:2]
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real
@@ -1230,6 +1240,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                    head_dim); mutated in-place.
             core_attn_out: Pre-allocated output buffer for attention results.
         """
+        if self.cache_config.use_gdn_recoverssm:
+            raise NotImplementedError("GDN RecoverSSM is CUDA-only")
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
 
@@ -1373,7 +1385,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                # RecoverSSM keeps one checkpoint slot ([N, 1]), but the conv
+                # window still spans all S = 1 + num_spec tokens.
+                max_query_len=(1 + self.num_spec)
+                if self.cache_config.use_gdn_recoverssm
+                else spec_state_indices_tensor.size(-1),
                 validate_data=False,
             )
 
@@ -1496,6 +1512,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_indices=spec_state_indices_tensor,
                 num_accepted_tokens=num_accepted_tokens,
                 use_qk_l2norm_in_kernel=True,
+                recoverssm_records=(
+                    (self_kv_cache[2], self_kv_cache[3], self_kv_cache[4])
+                    if self.cache_config.use_gdn_recoverssm
+                    else None
+                ),
             )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
@@ -1850,8 +1871,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self, attn_metadata: GDNAttentionMetadata
     ) -> bool:
         state_indices = attn_metadata.spec_state_indices_tensor
+        # The fused CUDA MTP kernel has no RecoverSSM record mode.
         return (
-            attn_metadata.spec_sequence_masks is not None
+            not self.cache_config.use_gdn_recoverssm
+            and attn_metadata.spec_sequence_masks is not None
             and attn_metadata.num_decodes == 0
             and attn_metadata.num_spec_decodes > 0
             and self.kv_cache[1].dtype in FUSED_GDN_STATE_DTYPES

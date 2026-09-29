@@ -1645,6 +1645,15 @@ def validate_kv_cache_layout(
         )
 
 
+def round_retention_interval(interval: int | None, block: int) -> int | None:
+    """Snap a positive retention interval to the nearest multiple of the
+    scheduler block (at least one block). None (dense) and 0 (reachable
+    boundaries only) are distinct modes and pass through."""
+    if not interval:
+        return interval
+    return max(1, (interval + block // 2) // block) * block
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1797,7 +1806,7 @@ def get_kv_cache_config_from_groups(
             )
             byte_offset += len(layer_names) * spec.page_size_bytes
 
-    return KVCacheConfig(
+    kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
@@ -1805,6 +1814,23 @@ def get_kv_cache_config_from_groups(
             vllm_config.cache_config.prefix_cache_retention_interval
         ),
     )
+    requested = kv_cache_config.prefix_cache_retention_interval
+    if requested:
+        scheduler_block_size, _ = resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config
+        )
+        rounded = round_retention_interval(requested, scheduler_block_size)
+        assert rounded is not None  # requested is truthy, so rounded is int
+        if rounded != requested:
+            logger.info_once(
+                "prefix_cache_retention_interval %d -> %d (%d x %d-token block)",
+                requested,
+                rounded,
+                rounded // scheduler_block_size,
+                scheduler_block_size,
+            )
+            kv_cache_config.prefix_cache_retention_interval = rounded
+    return kv_cache_config
 
 
 def _promote_local_kv_cache_specs(
