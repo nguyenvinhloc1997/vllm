@@ -157,7 +157,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 
-        self.use_recoverssm: bool = vllm_config.cache_config.use_gdn_recoverssm
+        self.use_recoverssm: bool = getattr(
+            vllm_config.cache_config, "use_gdn_recoverssm", False
+        )
         self.spec_state_slots: int = 1 if self.use_recoverssm else self.num_spec + 1
         self.recoverssm_context: Any = None
         if self.use_recoverssm:
