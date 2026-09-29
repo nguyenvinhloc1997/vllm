@@ -292,3 +292,30 @@ def test_recoverssm_oversize_row_takes_prefill_path(monkeypatch):
     assert meta.spec_sequence_masks.cpu().tolist() == [True, False]
     assert meta.num_prefills == 1
     assert meta.num_prefill_tokens == 20
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA")
+def test_recoverssm_context_from_real_layer_caches():
+    """_get_recoverssm_context resolves layers by name and validates their pages."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+
+    builder = _create_recoverssm_builder(3)
+    s, hv, k, blocks, dev = 4, 48, 128, 3, "cuda"
+    conv = torch.zeros(blocks, 64, 3 + 3, dtype=torch.bfloat16, device=dev)
+    if not is_conv_state_dim_first():
+        conv = conv.transpose(-1, -2).contiguous()
+    page = (
+        conv,
+        torch.zeros(blocks, hv, k, k, dtype=torch.float16, device=dev),
+        torch.zeros(blocks, hv, s, k, dtype=torch.float32, device=dev),
+        torch.zeros(blocks, hv, s, k, dtype=torch.float32, device=dev),
+        torch.zeros(blocks, hv, s, dtype=torch.float32, device=dev),
+    )
+    builder.vllm_config.compilation_config.static_forward_context["layer.0"] = (
+        SimpleNamespace(kv_cache=page)
+    )
+    ctx = builder._get_recoverssm_context()
+    assert ctx is builder._get_recoverssm_context()  # cached
+    assert ctx.spec_query_len == s and not ctx.damp
