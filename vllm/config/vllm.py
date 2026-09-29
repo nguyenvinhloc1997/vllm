@@ -3287,6 +3287,11 @@ class VllmConfig:
                 )
             if self.mamba_config.backend != MambaBackendEnum.TRITON:
                 raise ValueError("RecoverSSM requires --mamba-backend triton")
+        elif self.cache_config.use_gdn_recoverssm:
+            # Validated above; the checks below are for plain (non-spec)
+            # Mamba2 ReplaySSM, whose Triton kernel is V1-only.
+            if self.mamba_config.backend != MambaBackendEnum.TRITON:
+                raise ValueError("RecoverSSM requires --mamba-backend triton")
         elif self.cache_config.mamba_cache_mode == "all":
             raise ValueError(
                 "--use-replayssm supports prefix caching only in align mode; "
