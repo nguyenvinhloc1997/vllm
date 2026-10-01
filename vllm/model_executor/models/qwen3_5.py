@@ -29,6 +29,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -73,6 +74,7 @@ from .interfaces import (
     SupportsPP,
     _require_is_multimodal,
 )
+from .ngm_residual import NgramResidual, parse_layer_ids
 from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from .qwen3_next import (
     Qwen3NextAttention,
@@ -203,6 +205,29 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 ),
             )
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        positions: torch.Tensor = None,
+        **kwargs: object,
+    ):
+        hidden_states, residual = super().forward(
+            hidden_states, residual, positions, **kwargs
+        )
+        memory = getattr(self, "_ngm_memory", None)
+        ids_fn = getattr(self, "_ngm_ids_fn", None)
+        if memory is None or ids_fn is None:
+            return hidden_states, residual
+        input_ids = ids_fn()
+        if input_ids is None:
+            return hidden_states, residual
+        # M-RoPE positions are (3, L); the temporal row is the text position.
+        text_pos = positions[0] if positions.dim() == 2 else positions
+        stream = hidden_states if residual is None else hidden_states + residual
+        enhanced = memory(stream, input_ids, text_pos)
+        return hidden_states + (enhanced - stream), residual
+
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -272,6 +297,44 @@ class Qwen3_5Model(Qwen3NextModel):
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        self._ngm_ids: torch.Tensor | None = None
+        self._ngm_enabled = False
+        if envs.VLLM_NGM:
+            layer_ids = parse_layer_ids(envs.VLLM_NGM_LAYERS, config.num_hidden_layers)
+            memory = NgramResidual(
+                self.embed_tokens,
+                embedding_dim=config.hidden_size,
+                output_scale=envs.VLLM_NGM_SCALE,
+            )
+            for i in layer_ids:
+                layer = self.layers[i]
+                if isinstance(layer, Qwen3_5DecoderLayer):
+                    layer._ngm_memory = memory
+                    layer._ngm_ids_fn = lambda: self._ngm_ids
+            self._ngm_enabled = True
+            logger.info(
+                "NGM residual enabled layers=%s scale=%s",
+                layer_ids,
+                envs.VLLM_NGM_SCALE,
+            )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
+        if self._ngm_enabled:
+            if input_ids is None and inputs_embeds is not None:
+                # Without ids NGM would silently do nothing; the multimodal
+                # model keeps them via requires_raw_input_tokens.
+                raise RuntimeError("VLLM_NGM needs input_ids next to inputs_embeds")
+            # Read by the NGM layers during this forward only.
+            self._ngm_ids = input_ids
+        return super().forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # FSE must match construction (Qwen3NextSparseMoeBlock): reroute the
@@ -526,6 +589,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+        # NGM reads token ids; the runner drops them for multimodal models.
+        self.requires_raw_input_tokens = envs.VLLM_NGM
 
     def embed_input_ids(
         self,
@@ -745,6 +810,8 @@ class Qwen3_5MoeForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+        # NGM reads token ids; the runner drops them for multimodal models.
+        self.requires_raw_input_tokens = envs.VLLM_NGM
 
         # set MoE hyperparameters
         self.set_moe_parameters()
