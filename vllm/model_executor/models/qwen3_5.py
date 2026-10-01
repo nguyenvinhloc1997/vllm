@@ -342,8 +342,8 @@ class Qwen3_5Model(Qwen3NextModel):
     ):
         if self._ngm_memory is not None:
             if input_ids is None and inputs_embeds is not None:
-                # NGM silently did nothing on the multimodal model before
-                # requires_raw_input_tokens was set; fail loud instead.
+                # Without ids NGM would silently do nothing; the multimodal
+                # model keeps them via requires_raw_input_tokens.
                 raise RuntimeError("VLLM_NGM needs input_ids next to inputs_embeds")
             # Built once per forward and read by every NGM layer.
             self._ngm_ngrams = (
