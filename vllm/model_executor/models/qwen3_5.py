@@ -77,7 +77,7 @@ from .interfaces import (
     SupportsReplaySSM,
     _require_is_multimodal,
 )
-from .ngm_residual import NgramResidual, parse_layer_ids, update_input_ids
+from .ngm_residual import NgramResidual, parse_layer_ids
 from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from .qwen3_next import (
     Qwen3NextAttention,
@@ -222,11 +222,13 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         ids_fn = getattr(self, "_ngm_ids_fn", None)
         if memory is None or ids_fn is None:
             return hidden_states, residual
-        full_ids = ids_fn()
-        if full_ids is None:
+        input_ids = ids_fn()
+        if input_ids is None:
             return hidden_states, residual
+        # M-RoPE positions are (3, L); the temporal row is the text position.
+        text_pos = positions[0] if positions.dim() == 2 else positions
         stream = hidden_states if residual is None else hidden_states + residual
-        enhanced = memory(stream, full_ids)
+        enhanced = memory(stream, input_ids, text_pos)
         return hidden_states + (enhanced - stream), residual
 
 
@@ -326,8 +328,13 @@ class Qwen3_5Model(Qwen3NextModel):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ):
-        if self._ngm_enabled and input_ids is not None:
-            self._ngm_ids = update_input_ids(self._ngm_ids, input_ids)
+        if self._ngm_enabled:
+            if input_ids is None and inputs_embeds is not None:
+                # NGM silently did nothing on the multimodal model before
+                # requires_raw_input_tokens was set; fail loud instead.
+                raise RuntimeError("VLLM_NGM needs input_ids next to inputs_embeds")
+            # Read by the NGM layers during this forward only.
+            self._ngm_ids = input_ids
         return super().forward(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -617,6 +624,8 @@ class Qwen3_5ForConditionalGeneration(
             self.language_model.make_empty_intermediate_tensors
         )
         self._use_gdn_recoverssm = vllm_config.cache_config.use_gdn_recoverssm
+        # NGM reads token ids; the runner drops them for multimodal models.
+        self.requires_raw_input_tokens = envs.VLLM_NGM
 
     def embed_input_ids(
         self,
@@ -862,6 +871,8 @@ class Qwen3_5MoeForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+        # NGM reads token ids; the runner drops them for multimodal models.
+        self.requires_raw_input_tokens = envs.VLLM_NGM
 
         # set MoE hyperparameters
         self.set_moe_parameters()

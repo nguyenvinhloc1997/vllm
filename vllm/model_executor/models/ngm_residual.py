@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# N-gram residual (PioneerQyw/NGM math). Callable embed; 2D hidden OK.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# N-gram residual (PioneerQyw/NGM math) over vLLM's flat token batch.
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+# Pad value for shifted positions; no real position equals it minus a shift.
+_NO_POS = -(2**31)
 
 
 def default_layer_ids(num_layers: int) -> list[int]:
@@ -24,16 +28,14 @@ def parse_layer_ids(spec: str, num_layers: int) -> list[int]:
     return [i for i in ids if 0 <= i < num_layers]
 
 
-def update_input_ids(cache: torch.Tensor | None, ids: torch.Tensor) -> torch.Tensor:
-    if ids.dim() == 1:
-        ids = ids.view(1, -1)
-    if cache is None or ids.shape[-1] > 1:
-        return ids
-    return torch.cat([cache, ids], dim=-1)
-
-
 class NgramResidual(nn.Module):
-    """Cosine-gated 2-/3-gram residual. Same avg_pool / ReLU math as PioneerQyw."""
+    """Cosine-gated 2-/3-gram residual. Same mean-of-n / ReLU math as PioneerQyw.
+
+    Inputs are vLLM's flat batch: several requests back to back, plus CUDA
+    graph padding. A token's n-gram only uses an earlier token of the batch
+    when that token sits at the expected position (same request, contiguous);
+    anything else counts as zero, like the zero pad at sequence start.
+    """
 
     def __init__(
         self,
@@ -50,53 +52,43 @@ class NgramResidual(nn.Module):
         self.use_relu = use_relu
         self.output_scale = output_scale
 
-    def _lookup(self, input_ids: torch.Tensor) -> torch.Tensor:
-        tokens = self.embed(input_ids)
-        if tokens.dim() == 2:
-            tokens = tokens.view(*input_ids.shape, self.hidden_size)
-        return tokens
-
-    def build_ngram_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if input_ids.dim() == 1:
-            input_ids = input_ids.view(1, -1)
-        token_embeds = self._lookup(input_ids)
-        B, L, _ = token_embeds.shape
-        device = token_embeds.device
-        all_ngram_embeds = []
-        for n in self.ngram_sizes:
-            if L < n:
-                ngram_embed = torch.zeros(
-                    B, L, self.hidden_size, device=device, dtype=token_embeds.dtype
-                )
-            else:
-                padded = F.pad(token_embeds, (0, 0, n - 1, 0), mode="constant", value=0)
-                padded_t = padded.transpose(1, 2)
-                ngram_embed_t = F.avg_pool1d(
-                    padded_t, kernel_size=n, stride=1, padding=0
-                )
-                ngram_embed = ngram_embed_t.transpose(1, 2)
-            all_ngram_embeds.append(ngram_embed)
-        return torch.stack(all_ngram_embeds, dim=2)
+    def build_ngram_embeddings(
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """(L,) ids + (L,) positions -> (L, len(ngram_sizes), D)."""
+        # ponytail: a token right before a request boundary can pass the
+        # position check when its position happens to be the next request's
+        # first position minus k. Rare and 0.1-scaled; exact boundaries need
+        # query_start_loc from the runner.
+        token_embeds = self.embed(input_ids)
+        L = token_embeds.shape[0]
+        acc = token_embeds
+        out = []
+        for k in range(1, max(self.ngram_sizes)):
+            prev = F.pad(token_embeds, (0, 0, k, 0))[:L]
+            prev_pos = F.pad(positions, (k, 0), value=_NO_POS)[:L]
+            same_seq = (prev_pos == positions - k).unsqueeze(-1)
+            acc = acc + prev * same_seq.to(prev.dtype)
+            if k + 1 in self.ngram_sizes:
+                out.append(acc / (k + 1))
+        return torch.stack(out, dim=1)
 
     def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
     ) -> torch.Tensor:
-        squeezed = hidden_states.dim() == 2
-        if squeezed:
-            hidden_states = hidden_states.unsqueeze(0)
-        if input_ids.dim() == 1:
-            input_ids = input_ids.view(1, -1)
-        _B, L, _D = hidden_states.shape
-        ngram_embeds = self.build_ngram_embeddings(input_ids)[:, -L:, :, :].to(
-            device=hidden_states.device, dtype=hidden_states.dtype
+        L = hidden_states.shape[0]
+        ngram_embeds = self.build_ngram_embeddings(input_ids[:L], positions[:L]).to(
+            dtype=hidden_states.dtype
         )
         hidden_norm = F.normalize(hidden_states, p=2, dim=-1)
         ngram_norm = F.normalize(ngram_embeds, p=2, dim=-1)
-        similarity = torch.einsum("bld,blnd->bln", hidden_norm, ngram_norm)
+        similarity = torch.einsum("ld,lnd->ln", hidden_norm, ngram_norm)
         if self.use_relu:
             similarity = F.relu(similarity)
         update = (
-            torch.einsum("bln,blnd->bld", similarity, ngram_embeds) * self.output_scale
+            torch.einsum("ln,lnd->ld", similarity, ngram_embeds) * self.output_scale
         )
-        out = hidden_states + update
-        return out.squeeze(0) if squeezed else out
+        return hidden_states + update
