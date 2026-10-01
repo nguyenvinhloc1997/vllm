@@ -49,6 +49,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces import requires_raw_input_tokens
+from vllm.model_executor.models.ngm_residual import fill_ngm_prev_ids
 from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
@@ -422,6 +423,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+        # NGM (qwen3_5) reads each token's previous ids from this model buffer.
+        self.ngm_prev_ids = next(
+            (b for n, b in self.model.named_buffers() if n.endswith("ngm_prev_ids")),
+            None,
+        )
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -1398,6 +1404,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
         )
+        if self.ngm_prev_ids is not None:
+            fill_ngm_prev_ids(
+                self.ngm_prev_ids,
+                self.input_buffers.input_ids,
+                self.input_buffers.positions,
+                idx_mapping,
+                query_start_loc,
+                self.req_states.all_token_ids.gpu,
+            )
 
         fast_prefill = None
         if self.fast_prefill is not None:
