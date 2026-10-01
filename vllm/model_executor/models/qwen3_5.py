@@ -77,7 +77,7 @@ from .interfaces import (
     SupportsReplaySSM,
     _require_is_multimodal,
 )
-from .ngm_residual import NgramResidual, parse_layer_ids
+from .ngm_residual import NGM_HISTORY, NgramResidual, parse_layer_ids
 from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from .qwen3_next import (
     Qwen3NextAttention,
@@ -219,16 +219,14 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             hidden_states, residual, positions, **kwargs
         )
         memory = getattr(self, "_ngm_memory", None)
-        ids_fn = getattr(self, "_ngm_ids_fn", None)
-        if memory is None or ids_fn is None:
+        ngrams_fn = getattr(self, "_ngm_ngrams_fn", None)
+        if memory is None or ngrams_fn is None:
             return hidden_states, residual
-        input_ids = ids_fn()
-        if input_ids is None:
+        ngrams = ngrams_fn()
+        if ngrams is None:
             return hidden_states, residual
-        # M-RoPE positions are (3, L); the temporal row is the text position.
-        text_pos = positions[0] if positions.dim() == 2 else positions
         stream = hidden_states if residual is None else hidden_states + residual
-        enhanced = memory(stream, input_ids, text_pos)
+        enhanced = memory(stream, ngrams)
         return hidden_states + (enhanced - stream), residual
 
 
@@ -300,9 +298,23 @@ class Qwen3_5Model(Qwen3NextModel):
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
-        self._ngm_ids: torch.Tensor | None = None
-        self._ngm_enabled = False
+        self._ngm_memory: NgramResidual | None = None
+        self._ngm_ngrams: tuple[torch.Tensor, torch.Tensor] | None = None
         if envs.VLLM_NGM:
+            if not vllm_config.use_v2_model_runner:
+                # Only the V2 runner fills ngm_prev_ids; without it every
+                # n-gram would silently lose its history.
+                raise ValueError("VLLM_NGM needs the V2 model runner")
+            # Filled by the runner before each forward (fill_ngm_prev_ids).
+            self.register_buffer(
+                "ngm_prev_ids",
+                torch.full(
+                    (vllm_config.scheduler_config.max_num_batched_tokens, NGM_HISTORY),
+                    -1,
+                    dtype=torch.int32,
+                ),
+                persistent=False,
+            )
             layer_ids = parse_layer_ids(envs.VLLM_NGM_LAYERS, config.num_hidden_layers)
             memory = NgramResidual(
                 self.embed_tokens,
@@ -313,8 +325,8 @@ class Qwen3_5Model(Qwen3NextModel):
                 layer = self.layers[i]
                 if isinstance(layer, Qwen3_5DecoderLayer):
                     layer._ngm_memory = memory
-                    layer._ngm_ids_fn = lambda: self._ngm_ids
-            self._ngm_enabled = True
+                    layer._ngm_ngrams_fn = lambda: self._ngm_ngrams
+            self._ngm_memory = memory
             logger.info(
                 "NGM residual enabled layers=%s scale=%s",
                 layer_ids,
@@ -328,13 +340,19 @@ class Qwen3_5Model(Qwen3NextModel):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ):
-        if self._ngm_enabled:
+        if self._ngm_memory is not None:
             if input_ids is None and inputs_embeds is not None:
                 # NGM silently did nothing on the multimodal model before
                 # requires_raw_input_tokens was set; fail loud instead.
                 raise RuntimeError("VLLM_NGM needs input_ids next to inputs_embeds")
-            # Read by the NGM layers during this forward only.
-            self._ngm_ids = input_ids
+            # Built once per forward and read by every NGM layer.
+            self._ngm_ngrams = (
+                None
+                if input_ids is None
+                else self._ngm_memory.ngrams(
+                    input_ids, self.ngm_prev_ids[: input_ids.shape[0]]
+                )
+            )
         return super().forward(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
